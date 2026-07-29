@@ -23,10 +23,18 @@
   var ROOT_CLASS = "roche-plugin-dms";
   var STYLE_ID = ROOT_CLASS + "-style";
   var STORAGE_SETTINGS = "dms-settings";
-  var STORAGE_DIARIES = "dms-diaries";
+  var STORAGE_DIARIES = "dms-diaries";               // 旧版统一存储（启动时自动迁移到下面两个）
+  var STORAGE_DIARIES_SWAP = "dms-diaries-swap";     // 交换日记存储（user 与 char 交互）
+  var STORAGE_DIARIES_SOLO = "dms-diaries-solo";     // char 独自日记存储（只看char日记/整理记忆）
   var STORAGE_STICKERS = "dms-stickers";
   var STORAGE_CUSTOM_NOTES = "dms-custom-notes";   // user自定义便签样式（CSS）
   var STORAGE_PRESETS = "dms-presets";              // 思维链/格式预设
+  var MIGRATED_KEY = "dms-migrated-v2.4";           // 旧数据迁移标记
+
+  /* 根据 mode 返回对应存储键 */
+  function storageKeyFor(mode) {
+    return mode === "swap" ? STORAGE_DIARIES_SWAP : STORAGE_DIARIES_SOLO;
+  }
 
   /* ---------- 默认设置 ---------- */
   var DEFAULT_SETTINGS = {
@@ -363,24 +371,66 @@
   }
   function saveSettings(roche, s) { return roche.storage.set(STORAGE_SETTINGS, s); }
 
-  /* ---------- 日记存储 ---------- */
-  function getDiaries(roche) {
-    return roche.storage.get(STORAGE_DIARIES).then(function (s) { return s || {}; }).catch(function () { return {}; });
+  /* ---------- 日记存储 ----------
+   * 两种存储分别保存「交换日记」和「char独自日记」
+   * 通过 mode 参数区分：mode="swap" → 交换日记；mode="solo" → char独自日记
+   * 旧数据（STORAGE_DIARIES）在启动时自动迁移到对应存储
+   */
+  function getDiariesByMode(roche, mode) {
+    var key = storageKeyFor(mode);
+    return roche.storage.get(key).then(function (s) { return s || {}; }).catch(function () { return {}; });
   }
-  function getDiary(roche, key) {
-    return getDiaries(roche).then(function (all) { return all[key] || null; });
+  function getDiaryByMode(roche, mode, diaryKey) {
+    return getDiariesByMode(roche, mode).then(function (all) { return all[diaryKey] || null; });
   }
-  function saveDiary(roche, key, data) {
-    return getDiaries(roche).then(function (all) {
-      all[key] = data;
-      return roche.storage.set(STORAGE_DIARIES, all);
+  function saveDiaryByMode(roche, mode, diaryKey, data) {
+    return getDiariesByMode(roche, mode).then(function (all) {
+      all[diaryKey] = data;
+      return roche.storage.set(storageKeyFor(mode), all);
     });
   }
-  function deleteDiary(roche, key) {
-    return getDiaries(roche).then(function (all) {
-      delete all[key];
-      return roche.storage.set(STORAGE_DIARIES, all);
+  function deleteDiaryByMode(roche, mode, diaryKey) {
+    return getDiariesByMode(roche, mode).then(function (all) {
+      delete all[diaryKey];
+      return roche.storage.set(storageKeyFor(mode), all);
     });
+  }
+
+  /* 获取两种模式全部日记（历史列表用）—— 返回 {swap: {...}, solo: {...}} */
+  function getAllDiariesBothModes(roche) {
+    return Promise.all([
+      getDiariesByMode(roche, "swap"),
+      getDiariesByMode(roche, "solo")
+    ]).then(function (results) {
+      return { swap: results[0], solo: results[1] };
+    });
+  }
+
+  /* ---------- 旧数据迁移 ---------- */
+  function migrateOldDiariesIfNeeded(roche) {
+    return roche.storage.get(MIGRATED_KEY).then(function (done) {
+      if (done) return;  // 已迁移过
+      return roche.storage.get(STORAGE_DIARIES).then(function (oldAll) {
+        if (!oldAll || typeof oldAll !== "object") {
+          return roche.storage.set(MIGRATED_KEY, true);
+        }
+        var swapAll = {}, soloAll = {};
+        Object.keys(oldAll).forEach(function (k) {
+          var it = oldAll[k];
+          // 旧日记没有 mode 字段：根据 userDiary 是否有内容判断
+          // 有 userDiary 的归交换日记，否则归 char 独自日记
+          var mode = (it.userDiary && it.userDiary.trim()) ? "swap" : "solo";
+          it.mode = mode;
+          if (mode === "swap") swapAll[k] = it;
+          else soloAll[k] = it;
+        });
+        return Promise.all([
+          roche.storage.set(STORAGE_DIARIES_SWAP, swapAll),
+          roche.storage.set(STORAGE_DIARIES_SOLO, soloAll),
+          roche.storage.set(MIGRATED_KEY, true)
+        ]);
+      });
+    }).catch(function () {});
   }
 
   /* ---------- 表情包库存储 ----------
@@ -1044,6 +1094,7 @@
       lastError: "",
       view: "cover",
       subView: null,        // 交换模式子视图: null(非交换/默认双页) | "userWrite" | "charDiary"
+      diaryMode: "solo",     // "swap"=交换日记 | "solo"=char独自日记（决定使用哪个存储）
       currentDiary: null,
       diaryKey: "",
       annotMenuEl: null,
@@ -1637,7 +1688,7 @@
         if (!state.currentDiary) return;
         roche.ui.confirm({ title: "\u5220\u9664\u65e5\u8bb0", message: "\u5220\u9664\u8fd9\u7bc7\u65e5\u8bb0\u53ca\u6240\u6709\u6279\u6ce8\uff1f" }).then(function (ok) {
           if (!ok) return;
-          deleteDiary(roche, state.diaryKey).then(function () { toast("\u5df2\u5220\u9664"); state.view = "cover"; state.currentDiary = null; state.subView = null; renderContent(); });
+          deleteDiaryByMode(roche, state.currentDiary.mode || state.diaryMode, state.diaryKey).then(function () { toast("\u5df2\u5220\u9664"); state.view = "cover"; state.currentDiary = null; state.subView = null; renderContent(); });
         });
       } }, ["\u5220\u9664\u65e5\u8bb0"]));
 
@@ -3482,27 +3533,38 @@
       var wrap = el("div", { class: "dms-wrap dms-fade-in" });
       var card = el("div", { class: "dms-card" }, [
         el("h2", {}, ["\u5386\u53f2\u65e5\u8bb0"]),
-        el("div", { class: "dms-card-sub" }, ["\u4fdd\u5b58\u5728\u672c\u63d2\u4ef6\u79c1\u6709\u5b58\u50a8\uff0c\u5378\u8f7d\u4f1a\u4e00\u5e76\u6e05\u9664\u3002"])
+        el("div", { class: "dms-card-sub" }, ["\u4ea4\u6362\u65e5\u8bb0\u4e0e char \u65e5\u8bb0\u5206\u5f00\u5b58\u50a8\uff0c\u5378\u8f7d\u4f1a\u4e00\u5e76\u6e05\u9664\u3002"])
       ]);
       wrap.appendChild(card);
-      getDiaries(roche).then(function (all) {
-        var keys = Object.keys(all).sort(function (a, b) {
-          return (all[b].updatedAt || all[b].createdAt || 0) - (all[a].updatedAt || all[a].createdAt || 0);
+      getAllDiariesBothModes(roche).then(function (result) {
+        // 合并 swap 和 solo，标注类型
+        var allEntries = [];
+        Object.keys(result.swap).forEach(function (k) {
+          allEntries.push({ key: k, mode: "swap", data: result.swap[k] });
         });
-        if (!keys.length) {
+        Object.keys(result.solo).forEach(function (k) {
+          allEntries.push({ key: k, mode: "solo", data: result.solo[k] });
+        });
+        allEntries.sort(function (a, b) {
+          return (b.data.updatedAt || b.data.createdAt || 0) - (a.data.updatedAt || a.data.createdAt || 0);
+        });
+
+        if (!allEntries.length) {
           card.appendChild(el("div", { class: "dms-empty" }, ["\u6682\u65e0\u65e5\u8bb0\u3002"]));
         } else {
-          keys.forEach(function (k) {
-            var it = all[k];
+          allEntries.forEach(function (entry) {
+            var it = entry.data;
+            var mode = entry.mode;
             var item = el("div", { class: "dms-hist", onclick: function () {
-              state.diaryKey = k;
+              state.diaryKey = entry.key;
+              state.diaryMode = mode;    // 切换到对应存储
               state.currentDiary = it;
               state.selectedConvId = it.conversationId || "";
               state.selectedConv = { conversationId: it.conversationId, name: it.charName, handle: it.charName };
               state.selectedDate = parseDateInput(it.dateKey || toDateInput(new Date()));
               state.lastError = "";
-              // 根据交换模式与日记内容设置子视图
-              if (state.settings.swapMode) {
+              // 根据日记类型与内容设置子视图
+              if (mode === "swap") {
                 state.subView = (it.userDiary && it.userDiary.trim()) ? "charDiary" : "userWrite";
               } else {
                 state.subView = null;
@@ -3510,8 +3572,14 @@
               state.view = "diary";
               renderContent();
             } });
+            // 类型标签
+            var modeLabel = mode === "swap" ? "\u4ea4\u6362\u65e5\u8bb0" : "char\u65e5\u8bb0";
+            var modeColor = mode === "swap" ? "var(--red)" : "var(--blue)";
             item.appendChild(el("div", { class: "dms-hist-head" }, [
-              el("div", { class: "dms-hist-title" }, [(it.charName || "\u672a\u77e5") + " \u00b7 " + (it.dateKey || "")]),
+              el("div", { class: "dms-hist-title" }, [
+                (it.charName || "\u672a\u77e5") + " \u00b7 " + (it.dateKey || ""),
+                el("span", { style: { fontSize: "10px", color: modeColor, marginLeft: "6px", border: "1px solid " + modeColor, borderRadius: "3px", padding: "0 4px" } }, [modeLabel])
+              ]),
               el("div", { class: "dms-hist-date" }, [new Date(it.updatedAt || it.createdAt || 0).toLocaleString()])
             ]));
             item.appendChild(el("div", { class: "dms-hist-snippet" }, [(it.charDiary || "").slice(0, 60) + "\u2026"]));
@@ -3522,16 +3590,19 @@
             var btns = el("div", { style: { marginTop: "8px", display: "flex", gap: "6px" } });
             btns.appendChild(el("button", { class: "dms-btn dms-btn-sm", onclick: function (ev) {
               ev.stopPropagation();
-              deleteDiary(roche, k).then(function () { toast("\u5df2\u5220\u9664"); renderContent(); });
+              deleteDiaryByMode(roche, mode, entry.key).then(function () { toast("\u5df2\u5220\u9664"); renderContent(); });
             } }, ["\u5220\u9664"]));
             item.appendChild(btns);
             card.appendChild(item);
           });
           card.appendChild(el("div", { style: { marginTop: "10px" } }, [
             el("button", { class: "dms-btn dms-btn-sm", onclick: function () {
-              roche.ui.confirm({ title: "\u6e05\u7a7a", message: "\u6e05\u7a7a\u5168\u90e8\u65e5\u8bb0\uff1f" }).then(function (ok) {
+              roche.ui.confirm({ title: "\u6e05\u7a7a", message: "\u6e05\u7a7a\u5168\u90e8\u65e5\u8bb0\uff08\u4ea4\u6362\u65e5\u8bb0 + char\u65e5\u8bb0\uff09\uff1f" }).then(function (ok) {
                 if (!ok) return;
-                return roche.storage.set(STORAGE_DIARIES, {}).then(function () { toast("\u5df2\u6e05\u7a7a"); renderContent(); });
+                return Promise.all([
+                  roche.storage.set(STORAGE_DIARIES_SWAP, {}),
+                  roche.storage.set(STORAGE_DIARIES_SOLO, {})
+                ]).then(function () { toast("\u5df2\u6e05\u7a7a"); renderContent(); });
               });
             } }, ["\u6e05\u7a7a\u5168\u90e8"])
           ]));
@@ -3551,17 +3622,19 @@
       state.lastError = "";
       state.syncDialogShown = false;
 
-      getDiary(roche, state.diaryKey).then(function (existing) {
+      // 根据 swapMode 决定 diaryMode：交换日记 vs char独自日记
+      // 这决定使用哪个存储，彻底分开两种数据
+      state.diaryMode = state.settings.swapMode ? "swap" : "solo";
+
+      getDiaryByMode(roche, state.diaryMode, state.diaryKey).then(function (existing) {
         // 已有日记，直接打开（不强制重写）
         if (existing && existing.charDiary && !forceRegen) {
           state.currentDiary = existing;
-          if (state.settings.swapMode && existing.userDiary && existing.userDiary.trim()) {
-            // 交换模式且 user 已写过 → 直接进入看 char 日记模式
-            state.subView = "charDiary";
-          } else if (state.settings.swapMode) {
-            // 交换模式但 user 还没写 → 进入写日记模式
-            state.subView = "userWrite";
+          // 交换日记：根据 userDiary 内容决定子视图
+          if (state.diaryMode === "swap") {
+            state.subView = (existing.userDiary && existing.userDiary.trim()) ? "charDiary" : "userWrite";
           } else {
+            // char独自日记：无子视图，直接双页显示
             state.subView = null;
           }
           state.view = "diary";
@@ -3578,6 +3651,7 @@
             userName: "",
             dateKey: toDateKey(state.selectedDate),
             isGroup: info.isGroup,
+            mode: "swap",
             charDiary: "",
             userDiary: "",
             annotations: [],
@@ -3650,8 +3724,10 @@
             userName: ctx.userName,
             dateKey: ctx.dateKey,
             isGroup: ctx.isGroup,
+            mode: state.diaryMode,    // 记录日记类型，避免串台
             charDiary: diaryText || "",
-            userDiary: (existing && existing.userDiary) || (state.currentDiary && state.currentDiary.userDiary) || "",
+            // 修复缓存串台 bug：userDiary 只从 existing 取，不从 state.currentDiary 残留取
+            userDiary: (existing && existing.userDiary) || (state.diaryMode === "swap" && state.currentDiary && state.currentDiary.userDiary) || "",
             annotations: (existing && existing.annotations) || [],
             stickers: (existing && existing.stickers) || [],
             charAnnotations: charAnnots,
@@ -3659,7 +3735,7 @@
             createdAt: (existing && existing.createdAt) || (state.currentDiary && state.currentDiary.createdAt) || Date.now(),
             updatedAt: Date.now()
           };
-          return saveDiary(roche, state.diaryKey, diaryData).then(function () {
+          return saveDiaryByMode(roche, state.diaryMode, state.diaryKey, diaryData).then(function () {
             state.currentDiary = diaryData;
             // 设置子视图
             if (state.settings.swapMode) state.subView = "charDiary";
@@ -4192,18 +4268,24 @@
       return new Promise(function (resolve) {
         saveTimer = setTimeout(function () {
           state.currentDiary.updatedAt = Date.now();
-          saveDiary(roche, state.diaryKey, state.currentDiary).then(resolve).catch(resolve);
+          // 确保 mode 字段一致
+          var mode = state.currentDiary.mode || state.diaryMode || "solo";
+          state.currentDiary.mode = mode;
+          saveDiaryByMode(roche, mode, state.diaryKey, state.currentDiary).then(resolve).catch(resolve);
         }, 500);
       });
     }
 
     /* ---------- 加载 ---------- */
     function loadAll() {
-      return loadConversations(roche).then(function (convs) {
-        state.conversations = convs;
-        if (state.settings.useWorldbook) {
-          return loadWbTree(roche).then(function (t) { state.worldbookTree = t; });
-        }
+      // 先迁移旧数据（如果还没迁移过）
+      return migrateOldDiariesIfNeeded(roche).then(function () {
+        return loadConversations(roche).then(function (convs) {
+          state.conversations = convs;
+          if (state.settings.useWorldbook) {
+            return loadWbTree(roche).then(function (t) { state.worldbookTree = t; });
+          }
+        });
       });
     }
 
