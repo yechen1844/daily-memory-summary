@@ -433,6 +433,344 @@
     }).catch(function () {});
   }
 
+  /* ---------- 周期整理存储（按周/半月/月整理的日记） ----------
+   * 独立存储键，与 solo/swap 分开
+   * key 格式: "<cid>:<periodKey>"，periodKey 如 "2026-W30"、"2026-H2-07"、"2026-07"
+   * 数据结构: { ..., period: "week"|"halfmonth"|"month", periodKey, dateRange: [startKey, endKey], source: "chat"|"daily", sourceDiaries: [dateKey,...] }
+   */
+  var STORAGE_DIARIES_PERIOD = "dms-diaries-period";
+
+  function getPeriodDiaries(roche) {
+    return roche.storage.get(STORAGE_DIARIES_PERIOD).then(function (s) { return s || {}; }).catch(function () { return {}; });
+  }
+  function savePeriodDiary(roche, key, data) {
+    return getPeriodDiaries(roche).then(function (all) {
+      all[key] = data;
+      return roche.storage.set(STORAGE_DIARIES_PERIOD, all);
+    });
+  }
+  function deletePeriodDiary(roche, key) {
+    return getPeriodDiaries(roche).then(function (all) {
+      delete all[key];
+      return roche.storage.set(STORAGE_DIARIES_PERIOD, all);
+    });
+  }
+
+  /* 计算 periodKey 和日期范围 */
+  function getWeekKey(d) {
+    // ISO 周序号
+    var x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    var day = x.getDay() || 7;  // 周日=7
+    var thursday = new Date(x);
+    thursday.setDate(x.getDate() + (4 - day));
+    var yearStart = new Date(thursday.getFullYear(), 0, 1);
+    var weekNum = Math.ceil(((thursday - yearStart) / 86400000 + 1) / 7);
+    return thursday.getFullYear() + "-W" + pad2(weekNum);
+  }
+  function getMonthKey(d) {
+    var x = new Date(d);
+    return x.getFullYear() + "-" + pad2(x.getMonth() + 1);
+  }
+  function getHalfMonthKey(d) {
+    var x = new Date(d);
+    var day = x.getDate();
+    var half = day <= 15 ? 1 : 2;
+    return x.getFullYear() + "-H" + half + "-" + pad2(x.getMonth() + 1);
+  }
+  function getPeriodRange(period, dateRef) {
+    // 返回 [startDateKey, endDateKey] 闭区间
+    var d = new Date(dateRef);
+    var start, end;
+    if (period === "week") {
+      var day = d.getDay() || 7;
+      start = new Date(d); start.setDate(d.getDate() - day + 1); start.setHours(0,0,0,0);
+      end = new Date(start); end.setDate(start.getDate() + 6);
+    } else if (period === "halfmonth") {
+      var day2 = d.getDate();
+      if (day2 <= 15) {
+        start = new Date(d.getFullYear(), d.getMonth(), 1);
+        end = new Date(d.getFullYear(), d.getMonth(), 15);
+      } else {
+        start = new Date(d.getFullYear(), d.getMonth(), 16);
+        end = new Date(d.getFullYear(), d.getMonth() + 1, 0); // 月末
+      }
+    } else { // month
+      start = new Date(d.getFullYear(), d.getMonth(), 1);
+      end = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+    }
+    return [toDateKey(start), toDateKey(end)];
+  }
+  function getPeriodLabel(period) {
+    return period === "week" ? "按周" : period === "halfmonth" ? "按半月" : "按月";
+  }
+
+  /* ---------- 周期整理生成函数 ----------
+   * period: "week" | "halfmonth" | "month"
+   * source: "chat"=整理聊天记录 | "daily"=整理已生成的按日日记
+   * dateRef: 基准日期（用于确定周期范围）
+   */
+  function generatePeriodDiary(roche, state, period, source, dateRef) {
+    var conv = state.selectedConv;
+    if (!conv) return Promise.reject(new Error("\u8bf7\u5148\u9009\u62e9\u7b14\u53cb"));
+    var cid = conv.conversationId || conv.id;
+    var range = getPeriodRange(period, dateRef);
+    var startKey = range[0], endKey = range[1];
+    var periodKey = period === "week" ? getWeekKey(dateRef)
+                   : period === "halfmonth" ? getHalfMonthKey(dateRef)
+                   : getMonthKey(dateRef);
+    var diaryKey = cid + ":" + periodKey;
+
+    // 构造 ctx（复用 buildCtx，但 dayShort 按范围聚合）
+    return buildCtxForRange(roche, state, startKey, endKey, source).then(function (ctx) {
+      if (!ctx.dayShort.length && source === "chat") {
+        return Promise.reject(new Error("\u8be5\u5468\u671f\u5185\u65e0\u804a\u5929\u8bb0\u5f55"));
+      }
+      if (source === "daily" && (!ctx.dailyDiaries || !ctx.dailyDiaries.length)) {
+        return Promise.reject(new Error("\u8be5\u5468\u671f\u5185\u65e0\u5df2\u751f\u6210\u7684\u6309\u65e5\u65e5\u8bb0"));
+      }
+      var msgs = buildPeriodDiaryMessages(ctx, state.settings, period, source, startKey, endKey);
+      return callAI(roche, msgs, 0.7).then(function (text) {
+        var diaryData = {
+          conversationId: cid,
+          charName: ctx.charName,
+          userName: ctx.userName,
+          dateKey: ctx.dateKey,
+          isGroup: ctx.isGroup,
+          mode: "period",
+          period: period,
+          periodKey: periodKey,
+          dateRange: range,
+          source: source,
+          sourceDiaries: ctx.dailyDiaries ? ctx.dailyDiaries.map(function (d) { return d.dateKey; }) : [],
+          charDiary: text || "",
+          userDiary: "",
+          annotations: [],
+          stickers: [],
+          charAnnotations: [],
+          ctx: ctx,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        return savePeriodDiary(roche, diaryKey, diaryData).then(function () {
+          return { diaryData: diaryData, diaryKey: diaryKey };
+        });
+      });
+    });
+  }
+
+  /* 构造周期范围上下文：聚合聊天记录或已生成的按日日记 */
+  function buildCtxForRange(roche, state, startKey, endKey, source) {
+    var conv = state.selectedConv;
+    var cid = conv.conversationId || conv.id;
+    var info = convInfo(conv);
+    var startDate = parseDateInput(startKey);
+    var endDate = parseDateInput(endKey);
+
+    return Promise.all([
+      loadShort(roche, cid, state.settings.messageLimit || 5000),
+      loadChar(roche, conv),
+      loadPersona(roche, conv),
+      loadLong(roche, cid),
+      state.settings.useWorldbook ? loadWbText(roche, state.settings) : Promise.resolve(""),
+      source === "daily" ? getDiariesByMode(roche, "solo") : Promise.resolve({})
+    ]).then(function (results) {
+      var allMsgs = results[0];
+      var ch = results[1];
+      var persona = results[2];
+      var mem = results[3];
+      var wb = results[4];
+      var soloDiaries = results[5] || {};
+
+      // 按日期范围过滤消息
+      var startTime = startOfDay(startDate).getTime();
+      var endTime = endOfDay(endDate);
+      var rangeMsgs = (allMsgs || []).filter(function (m) {
+        var t = toMs(m.timestamp);
+        return t >= startTime && t < endTime;
+      }).sort(function (a, b) { return toMs(a.timestamp) - toMs(b.timestamp); });
+
+      var shortText = msgsToText(rangeMsgs);
+
+      // 收集范围内的按日日记
+      var dailyDiaries = [];
+      if (source === "daily") {
+        Object.keys(soloDiaries).forEach(function (key) {
+          var parts = key.split(":");
+          if (parts[0] === cid) {
+            var dk = parts[1];
+            if (dk >= startKey && dk <= endKey) {
+              var dd = soloDiaries[key];
+              if (dd && dd.charDiary && dd.charDiary.trim()) {
+                dailyDiaries.push({ dateKey: dk, charDiary: dd.charDiary, charName: dd.charName });
+              }
+            }
+          }
+        });
+        dailyDiaries.sort(function (a, b) { return a.dateKey < b.dateKey ? -1 : 1; });
+      }
+
+      return {
+        conversationId: cid,
+        isGroup: info.isGroup,
+        userName: persona.name || info.name || "\u7528\u6237",
+        userPersona: persona.text || "",
+        charName: ch.name || info.name,
+        charText: ch.text || "",
+        dayShort: rangeMsgs,
+        shortText: shortText,
+        coreText: mem.core ? coreToText(mem.core) : "",
+        factsText: mem.facts ? factsToText(mem.facts) : "",
+        wbText: wb || "",
+        dateKey: startKey + "~" + endKey,
+        dailyDiaries: dailyDiaries
+      };
+    });
+  }
+
+  /* 构造周期整理的 messages */
+  function buildPeriodDiaryMessages(ctx, settings, period, source, startKey, endKey) {
+    var periodLabel = getPeriodLabel(period);
+    var sys = [];
+    sys.push("\u4f60\u662f " + (ctx.charName || "\u89d2\u8272") + "\u3002\u8bf7\u4ee5\u7b2c\u4e00\u4eba\u79f0\u5199\u4e00\u7bc7" + periodLabel + " (" + startKey + " \u81f3 " + endKey + ") \u7684\u65e5\u8bb0\u603b\u7ed3\u3002");
+    if (ctx.userPersona) sys.push("\u3010\u7528\u6237\u4eba\u8bbe\u3011" + ctx.userPersona);
+    if (ctx.charText) sys.push("\u3010\u89d2\u8272\u4eba\u8bbe\u3011" + ctx.charText);
+    if (settings.showCore && ctx.coreText) sys.push("\u3010\u6838\u5fc3\u8bb0\u5fc6\u3011" + ctx.coreText);
+    if (settings.showFacts && ctx.factsText) sys.push("\u3010\u4e8b\u5b9e\u8bb0\u5fc6\u3011" + ctx.factsText);
+    if (settings.useWorldbook && ctx.wbText) sys.push("\u3010\u4e16\u754c\u4e66\u3011" + ctx.wbText);
+
+    var userMsg = "";
+    if (source === "chat") {
+      userMsg = "\u3010" + periodLabel + "\u804a\u5929\u8bb0\u5f55 (" + startKey + " \u2014 " + endKey + ")\u3011\n" + (ctx.shortText || "\uff08\u65e0\u8bb0\u5f55\uff09");
+    } else {
+      userMsg = "\u3010" + periodLabel + "\u6309\u65e5\u65e5\u8bb0\u96c6 (" + startKey + " \u2014 " + endKey + ")\u3011\n";
+      (ctx.dailyDiaries || []).forEach(function (d) {
+        userMsg += "\n\u3010" + d.dateKey + " " + (d.charName || "") + "\u7684\u65e5\u8bb0\u3011\n" + d.charDiary + "\n";
+      });
+    }
+
+    if (settings.charThinkingChain) {
+      sys.push("\u3010\u601d\u7ef4\u94fe\u3011" + settings.charThinkingChain);
+    }
+    sys.push("\u8bf7\u7528 " + (ctx.charName || "\u4f60") + " \u7684\u53e3\u543b\u5199\u4e0b\u8fd9\u6bb5\u65f6\u95f4\u7684\u603b\u7ed3\uff0c\u6309\u4e8b\u4ef6\u987a\u5e8f\u6574\u7406\uff0c\u4fdd\u7559\u60c5\u611f\u4e0e\u7ec6\u8282\u3002\u6bcf\u6bb5100~200\u5b57\uff0c3~6\u6bb5\u3002");
+
+    return [
+      { role: "system", content: sys.join("\n\n") },
+      { role: "user", content: userMsg }
+    ];
+  }
+
+  /* ---------- 从长期记忆（事实记忆）挑选按日日记 ----------
+   * 读取事实记忆，按 when 字段（YYYY-MM-DD）判断是否为按日日记
+   * 按 user 设置的最低字数过滤
+   */
+  function pickDailyDiariesFromFactMemory(roche, cid, minChars) {
+    return loadLong(roche, cid).then(function (lt) {
+      var facts = (lt && lt.facts) || [];
+      minChars = minChars || 0;
+      var picked = [];
+      facts.forEach(function (f) {
+        var text = f.summaryText || f.action || f.text || "";
+        var when = f.when || "";
+        // 过滤：有日期、文本长度达标、source 是本插件写入的按日日记（更精准）
+        if (when && text.length >= minChars && when.length === 10) {
+          picked.push({
+            dateKey: when,
+            text: text,
+            fact: f
+          });
+        }
+      });
+      // 按日期排序
+      picked.sort(function (a, b) { return a.dateKey < b.dateKey ? -1 : 1; });
+      return picked;
+    });
+  }
+
+  /* ---------- 轮询批量生成按日日记 ----------
+   * dates: Array<"YYYY-MM-DD"> 要生成的日期列表
+   * onProgress: 可选回调 (currentIndex, total, success, errorMsg)
+   * 依次生成，避免并发导致 API 限流
+   */
+  function batchGenerateDailyDiaries(roche, state, dates, onProgress) {
+    var conv = state.selectedConv;
+    if (!conv) return Promise.reject(new Error("\u8bf7\u5148\u9009\u62e9\u7b14\u53cb"));
+    var cid = conv.conversationId || conv.id;
+    var results = [];
+    var idx = 0;
+
+    function next() {
+      if (idx >= dates.length) {
+        return Promise.resolve(results);
+      }
+      var currentDate = dates[idx];
+      var diaryKey = cid + ":" + currentDate;
+      var dateObj = parseDateInput(currentDate);
+
+      // 先检查是否已存在
+      return getDiaryByMode(roche, "solo", diaryKey).then(function (existing) {
+        if (existing && existing.charDiary && !state.overwriteExisting) {
+          results.push({ dateKey: currentDate, success: true, skipped: true, msg: "\u5df2\u5b58\u5728\uff0c\u8df3\u8fc7" });
+          if (onProgress) onProgress(idx, dates.length, true, "\u5df2\u5b58\u5728\uff0c\u8df3\u8fc7");
+          idx++;
+          return next();
+        }
+        // 构造临时 state
+        var tempState = Object.assign({}, state);
+        tempState.selectedDate = dateObj;
+        return buildCtx(roche, tempState, dateObj).then(function (ctx) {
+          if (!ctx.dayShort.length) {
+            results.push({ dateKey: currentDate, success: false, msg: "\u5f53\u65e5\u65e0\u804a\u5929\u8bb0\u5f55" });
+            if (onProgress) onProgress(idx, dates.length, false, "\u5f53\u65e5\u65e0\u804a\u5927\u8bb0\u5f55");
+            idx++;
+            return next();
+          }
+          return generateCharDiary(roche, ctx, state.settings).then(function (text) {
+            var diaryData = {
+              conversationId: ctx.conversationId,
+              charName: ctx.charName,
+              userName: ctx.userName,
+              dateKey: ctx.dateKey,
+              isGroup: ctx.isGroup,
+              mode: "solo",
+              charDiary: text || "",
+              userDiary: "",
+              annotations: [],
+              stickers: [],
+              charAnnotations: [],
+              ctx: ctx,
+              createdAt: Date.now(),
+              updatedAt: Date.now()
+            };
+            return saveDiaryByMode(roche, "solo", diaryKey, diaryData).then(function () {
+              results.push({ dateKey: currentDate, success: true, msg: "\u751f\u6210\u6210\u529f" });
+              if (onProgress) onProgress(idx, dates.length, true, "\u751f\u6210\u6210\u529f");
+              idx++;
+              return next();
+            });
+          });
+        }).catch(function (e) {
+          results.push({ dateKey: currentDate, success: false, msg: e && e.message || String(e) });
+          if (onProgress) onProgress(idx, dates.length, false, e && e.message || String(e));
+          idx++;
+          return next();
+        });
+      });
+    }
+
+    return next();
+  }
+
+  /* 辅助：列出会话中有聊天记录的日期（用于轮询选天） */
+  function listAvailableDates(roche, state) {
+    var conv = state.selectedConv;
+    if (!conv) return Promise.resolve([]);
+    var cid = conv.conversationId || conv.id;
+    return loadShort(roche, cid, state.settings.messageLimit || 5000).then(function (msgs) {
+      return coveredDays(msgs);
+    });
+  }
+
   /* ---------- 表情包库存储 ----------
    * 结构:
    * { groups: [{id, name, stickers:[{id,url,caption}]}],
@@ -1095,6 +1433,8 @@
       view: "cover",
       subView: null,        // 交换模式子视图: null(非交换/默认双页) | "userWrite" | "charDiary"
       diaryMode: "solo",     // "swap"=交换日记 | "solo"=char独自日记（决定使用哪个存储）
+      periodDialog: null,   // 周期整理对话框: null | "period" | "batch" | "pickFromMemory"
+      batchProgress: null,  // 轮询进度: null | {current, total, msg, running}
       currentDiary: null,
       diaryKey: "",
       annotMenuEl: null,
@@ -1266,6 +1606,14 @@
         body.appendChild(buildDiaryView());
       } else if (state.view === "history") {
         body.appendChild(buildHistory());
+      } else if (state.view === "periodDialog") {
+        body.appendChild(buildPeriodDialogView());
+      } else if (state.view === "batchDialog") {
+        body.appendChild(buildBatchDialogView());
+      } else if (state.view === "pickFromMemoryDialog") {
+        body.appendChild(buildPickFromMemoryView());
+      } else if (state.view === "periodDiaryView") {
+        body.appendChild(buildPeriodDiaryDisplayView());
       } else {
         body.appendChild(buildCover());
       }
@@ -1415,6 +1763,44 @@
         el("div", { class: "dms-card-sub" }, ["\u67e5\u770b\u4ee5\u524d\u5199\u8fc7\u7684\u65e5\u8bb0\u3002"])
       ]);
       wrap.appendChild(histCard);
+
+      // 高级功能入口
+      var advCard = el("div", { class: "dms-card tape-red dms-fade-in-delay" }, [
+        el("h2", {}, [el("span", { class: "dms-badge" }, ["\u2605"]), " \u8bb0\u5fc6\u6574\u7406"]),
+        el("div", { class: "dms-card-sub" }, ["\u6309\u5468\u671f\u6216\u6279\u91cf\u751f\u6210\u65e5\u8bb0\uff0c\u4ece\u957f\u671f\u8bb0\u5fc6\u6311\u9009\u7d20\u6750\u3002"])
+      ]);
+
+      // 周期整理入口
+      advCard.appendChild(el("button", {
+        class: "dms-btn dms-btn-sm dms-btn-ghost",
+        style: { width: "100%", marginTop: "8px", justifyContent: "flex-start" },
+        onclick: function () {
+          if (!state.selectedConv) { toast("\u8bf7\u5148\u9009\u62e9\u7b14\u53cb"); return; }
+          state.view = "periodDialog"; renderContent();
+        }
+      }, ["\u25cb \u6309\u5468/\u534a\u6708/\u6708\u6574\u7406"]));
+
+      // 轮询生成入口
+      advCard.appendChild(el("button", {
+        class: "dms-btn dms-btn-sm dms-btn-ghost",
+        style: { width: "100%", marginTop: "6px", justifyContent: "flex-start" },
+        onclick: function () {
+          if (!state.selectedConv) { toast("\u8bf7\u5148\u9009\u62e9\u7b14\u53cb"); return; }
+          state.view = "batchDialog"; renderContent();
+        }
+      }, ["\u25cb \u8f6e\u8be2\u6279\u91cf\u751f\u6210\u6309\u65e5\u65e5\u8bb0"]));
+
+      // 从长期记忆挑选入口
+      advCard.appendChild(el("button", {
+        class: "dms-btn dms-btn-sm dms-btn-ghost",
+        style: { width: "100%", marginTop: "6px", justifyContent: "flex-start" },
+        onclick: function () {
+          if (!state.selectedConv) { toast("\u8bf7\u5148\u9009\u62e9\u7b14\u53cb"); return; }
+          state.view = "pickFromMemoryDialog"; renderContent();
+        }
+      }, ["\u25cb \u4ece\u957f\u671f\u8bb0\u5fc6\u6311\u9009\u6309\u65e5\u65e5\u8bb0"]));
+
+      wrap.appendChild(advCard);
 
       return wrap;
     }
@@ -3528,6 +3914,372 @@
       return box;
     }
 
+    /* ---------- 周期整理对话框 ---------- */
+    function buildPeriodDialogView() {
+      var wrap = el("div", { class: "dms-wrap dms-fade-in" });
+      var card = el("div", { class: "dms-card" }, [
+        el("h2", {}, [el("span", { class: "dms-badge" }, ["\u2605"]), " \u6309\u5468\u671f\u6574\u7406"]),
+        el("div", { class: "dms-card-sub" }, ["\u9009\u62e9\u5468\u671f\u7c7b\u578b\u4e0e\u6574\u7406\u7d20\u6750\uff0c\u751f\u6210\u603b\u7ed3\u65e5\u8bb0\u3002"])
+      ]);
+
+      // 基准日期（默认当前选中日期）
+      var dateInput = el("input", { type: "date", class: "dms-input" });
+      dateInput.value = toDateInput(state.selectedDate);
+      dateInput.max = toDateInput(new Date());
+      dateInput.addEventListener("change", function () {
+        if (this.value) state.selectedDate = parseDateInput(this.value);
+      });
+      card.appendChild(el("div", { style: { marginBottom: "10px" } }, [
+        el("div", { style: { fontSize: "12px", color: "var(--ink-dim)", marginBottom: "4px" } }, ["\u57fa\u51c6\u65e5\u671f\uff08\u51b3\u5b9a\u5468\u671f\u8303\u56f4\uff09"]),
+        dateInput
+      ]));
+
+      // 周期类型选择
+      var periodType = "week";
+      var typeGroup = el("div", { style: { display: "flex", gap: "6px", marginBottom: "10px" } });
+      [["week", "\u6309\u5468"], ["halfmonth", "\u6309\u534a\u6708"], ["month", "\u6309\u6708"]].forEach(function (opt) {
+        var btn = el("button", {
+          class: "dms-btn dms-btn-sm" + (periodType === opt[0] ? " dms-btn-primary" : " dms-btn-ghost"),
+          onclick: function () {
+            periodType = opt[0];
+            typeGroup.querySelectorAll("button").forEach(function (b) {
+              b.classList.remove("dms-btn-primary");
+              b.classList.add("dms-btn-ghost");
+            });
+            btn.classList.remove("dms-btn-ghost");
+            btn.classList.add("dms-btn-primary");
+            updateRangeHint();
+          }
+        }, [opt[1]]);
+        typeGroup.appendChild(btn);
+      });
+      card.appendChild(typeGroup);
+
+      // 范围提示
+      var rangeHint = el("div", { style: { fontSize: "12px", color: "var(--blue)", marginBottom: "10px" } });
+      function updateRangeHint() {
+        var r = getPeriodRange(periodType, state.selectedDate);
+        rangeHint.textContent = "\u8303\u56f4\uff1a" + r[0] + " \u81f3 " + r[1];
+      }
+      updateRangeHint();
+      card.appendChild(rangeHint);
+
+      // 数据源选择
+      var sourceType = "chat";
+      var srcGroup = el("div", { style: { display: "flex", gap: "6px", marginBottom: "12px" } });
+      [["chat", "\u804a\u5929\u8bb0\u5f55"], ["daily", "\u5df2\u751f\u6210\u7684\u6309\u65e5\u65e5\u8bb0"]].forEach(function (opt) {
+        var btn = el("button", {
+          class: "dms-btn dms-btn-sm" + (sourceType === opt[0] ? " dms-btn-primary" : " dms-btn-ghost"),
+          onclick: function () {
+            sourceType = opt[0];
+            srcGroup.querySelectorAll("button").forEach(function (b) {
+              b.classList.remove("dms-btn-primary");
+              b.classList.add("dms-btn-ghost");
+            });
+            btn.classList.remove("dms-btn-ghost");
+            btn.classList.add("dms-btn-primary");
+          }
+        }, [opt[1]]);
+        srcGroup.appendChild(btn);
+      });
+      card.appendChild(srcGroup);
+
+      // 生成按钮
+      var genBtn = el("button", { class: "dms-btn dms-btn-primary", style: { width: "100%" } }, ["\u751f\u6210\u603b\u7ed3"]);
+      genBtn.addEventListener("click", function () {
+        genBtn.disabled = true;
+        genBtn.textContent = "\u751f\u6210\u4e2d...";
+        state.generating = true;
+        state.generatingMsg = "\u6b63\u5728\u751f\u6210" + getPeriodLabel(periodType) + "\u603b\u7ed3";
+        renderContent();
+        generatePeriodDiary(roche, state, periodType, sourceType, state.selectedDate).then(function (result) {
+          state.generating = false;
+          state.generatingMsg = "";
+          // 进入展示视图
+          state.currentDiary = result.diaryData;
+          state.diaryKey = result.diaryKey;
+          state.view = "periodDiaryView";
+          toast("\u751f\u6210\u6210\u529f");
+          renderContent();
+        }).catch(function (e) {
+          state.generating = false;
+          state.generatingMsg = "";
+          toast("\u751f\u6210\u5931\u8d25\uff1a" + (e && e.message || e));
+          renderContent();
+        });
+      });
+      card.appendChild(genBtn);
+
+      // 返回按钮
+      card.appendChild(el("button", {
+        class: "dms-btn dms-btn-ghost",
+        style: { width: "100%", marginTop: "6px" },
+        onclick: function () { state.view = "cover"; renderContent(); }
+      }, ["\u8fd4\u56de"]));
+
+      wrap.appendChild(card);
+
+      // 历史周期日记列表
+      var histCard = el("div", { class: "dms-card", style: { marginTop: "10px" } }, [
+        el("h2", {}, ["\u5386\u53f2\u603b\u7ed3"])
+      ]);
+      getPeriodDiaries(roche).then(function (all) {
+        var cid = state.selectedConv ? (state.selectedConv.conversationId || state.selectedConv.id) : "";
+        var keys = Object.keys(all).filter(function (k) { return k.indexOf(cid + ":") === 0; })
+          .sort(function (a, b) { return (all[b].updatedAt || all[b].createdAt || 0) - (all[a].updatedAt || all[a].createdAt || 0); });
+        if (!keys.length) {
+          histCard.appendChild(el("div", { class: "dms-empty" }, ["\u6682\u65e0\u603b\u7ed3\u3002"]));
+        } else {
+          keys.forEach(function (k) {
+            var it = all[k];
+            var label = getPeriodLabel(it.period) + " " + (it.periodKey || "");
+            var item = el("div", { class: "dms-hist", onclick: function () {
+              state.currentDiary = it;
+              state.diaryKey = k;
+              state.view = "periodDiaryView";
+              renderContent();
+            } }, [
+              el("div", { class: "dms-hist-head" }, [
+                el("div", { class: "dms-hist-title" }, [label]),
+                el("div", { class: "dms-hist-date" }, [new Date(it.updatedAt || it.createdAt || 0).toLocaleString()])
+              ]),
+              el("div", { class: "dms-hist-snippet" }, [(it.charDiary || "").slice(0, 60) + "\u2026"])
+            ]);
+            histCard.appendChild(item);
+          });
+        }
+      });
+      wrap.appendChild(histCard);
+
+      return wrap;
+    }
+
+    /* ---------- 周期日记展示视图 ---------- */
+    function buildPeriodDiaryDisplayView() {
+      var wrap = el("div", { class: "dms-wrap dms-fade-in" });
+      if (!state.currentDiary) {
+        wrap.appendChild(el("div", { class: "dms-card" }, ["\u672a\u627e\u5230\u65e5\u8bb0\u3002"]));
+        return wrap;
+      }
+      var d = state.currentDiary;
+      var card = el("div", { class: "dms-card" });
+      card.appendChild(el("div", { class: "dms-page-header" }, [
+        el("div", {}, [
+          el("div", { class: "dms-page-title" }, [getPeriodLabel(d.period) + " " + (d.periodKey || "")]),
+          el("div", { class: "dms-page-meta" }, [(d.dateRange || []).join(" \u81f3 ")])
+        ]),
+        el("div", { style: { display: "flex", gap: "4px" } }, [
+          el("button", { class: "dms-tool-btn", onclick: function () { state.view = "periodDialog"; renderContent(); } }, ["\u8fd4\u56de"])
+        ])
+      ]));
+      card.appendChild(el("div", { class: "dms-diary-text", style: { marginTop: "10px" } }, [d.charDiary || ""]));
+
+      // 显示数据源
+      if (d.source === "daily" && d.sourceDiaries && d.sourceDiaries.length) {
+        card.appendChild(el("div", { style: { marginTop: "10px", fontSize: "12px", color: "var(--ink-dim)", borderTop: "1px dashed var(--line)", paddingTop: "8px" } }, [
+          "\u6574\u7406\u81ea\u4ee5\u4e0b\u6309\u65e5\u65e5\u8bb0\uff1a" + d.sourceDiaries.join(" \u3001 ")
+        ]));
+      }
+
+      // 同步到事实记忆按钮
+      card.appendChild(el("button", {
+        class: "dms-btn dms-btn-sm dms-btn-primary",
+        style: { marginTop: "10px" },
+        onclick: function () {
+          var ctx = d.ctx || { conversationId: d.conversationId, charName: d.charName, userName: d.userName, dateKey: d.periodKey, isGroup: d.isGroup };
+          syncFact(roche, ctx, d.charDiary).then(function () {
+            toast("\u5df2\u540c\u6b65\u5230\u4e8b\u5b9e\u8bb0\u5fc6");
+          }).catch(function (e) {
+            toast("\u540c\u6b65\u5931\u8d25\uff1a" + (e && e.message || e));
+          });
+        }
+      }, ["\u540c\u6b65\u5230\u4e8b\u5b9e\u8bb0\u5fc6"]));
+      wrap.appendChild(card);
+      return wrap;
+    }
+
+    /* ---------- 轮询批量生成视图 ---------- */
+    function buildBatchDialogView() {
+      var wrap = el("div", { class: "dms-wrap dms-fade-in" });
+      var card = el("div", { class: "dms-card" }, [
+        el("h2", {}, [el("span", { class: "dms-badge" }, ["\u2605"]), " \u8f6e\u8be2\u6279\u91cf\u751f\u6210"]),
+        el("div", { class: "dms-card-sub" }, ["\u9009\u62e9\u591a\u4e2a\u65e5\u671f\uff0c\u4f9d\u6b21\u751f\u6210\u6309\u65e5\u65e5\u8bb0\u3002"])
+      ]);
+
+      // 范围选择模式
+      var useRangeMode = false;
+      var rangeStartInput = el("input", { type: "date", class: "dms-input", style: { flex: "1" } });
+      var rangeEndInput = el("input", { type: "date", class: "dms-input", style: { flex: "1" } });
+      rangeStartInput.max = toDateInput(new Date());
+      rangeEndInput.max = toDateInput(new Date());
+
+      // 点选日期列表
+      var dateListContainer = el("div", { style: { marginTop: "10px", maxHeight: "200px", overflowY: "auto", border: "1px solid var(--line)", borderRadius: "6px", padding: "6px" } });
+      var selectedDates = {};
+
+      function renderDateList(availableDates) {
+        dateListContainer.innerHTML = "";
+        if (!availableDates.length) {
+          dateListContainer.appendChild(el("div", { class: "dms-empty" }, ["\u6682\u65e0\u6709\u8bb0\u5f55\u7684\u65e5\u671f"]));
+          return;
+        }
+        availableDates.forEach(function (dk) {
+          var checked = !!selectedDates[dk];
+          var item = el("label", { style: { display: "flex", alignItems: "center", gap: "6px", padding: "4px 0", cursor: "pointer" } }, [
+            el("input", { type: "checkbox", checked: checked, onchange: function (e) {
+              if (e.target.checked) selectedDates[dk] = true;
+              else delete selectedDates[dk];
+            } }),
+            el("span", {}, [dk])
+          ]);
+          dateListContainer.appendChild(item);
+        });
+      }
+
+      // 加载可用的日期
+      listAvailableDates(roche, state).then(function (dates) {
+        renderDateList(dates);
+      });
+
+      // 范围模式开关
+      var modeSwitch = makeSwitch("\u8303\u56f4\u9009\u62e9\u6a21\u5f0f", "\u5f00\u542f\u540e\u53ef\u9009\u8d77\u6b62\u65e5\u671f\uff0c\u81ea\u52a8\u8865\u5143\u8303\u56f4\u5185\u6240\u6709\u5929\u6570\uff1b\u5173\u95ed\u5219\u70b9\u9009\u5217\u8868", useRangeMode, function (v) {
+        useRangeMode = v;
+        rangeStartInput.disabled = !v;
+        rangeEndInput.disabled = !v;
+        dateListContainer.style.opacity = v ? "0.4" : "1";
+      });
+      card.appendChild(modeSwitch);
+
+      card.appendChild(el("div", { style: { marginTop: "8px", fontSize: "12px", color: "var(--ink-dim)" } }, ["\u53ef\u70b9\u9009\u7684\u65e5\u671f\uff1a"]));
+      card.appendChild(dateListContainer);
+
+      card.appendChild(el("div", { style: { marginTop: "8px", fontSize: "12px", color: "var(--ink-dim)" } }, ["\u6216\u9009\u8d77\u6b62\u65e5\u671f\uff1a"]));
+      card.appendChild(el("div", { style: { display: "flex", gap: "6px" } }, [rangeStartInput, rangeEndInput]));
+      rangeStartInput.disabled = true;
+      rangeEndInput.disabled = true;
+
+      // 覆盖已存在开关
+      var overwriteSwitch = makeSwitch("\u8986\u76d6\u5df2\u5b58\u5728\u65e5\u8bb0", "\u5f00\u542f\u540e\u5c06\u91cd\u65b0\u751f\u6210\u5df2\u6709\u65e5\u8bb0\u7684\u65e5\u671f", state.overwriteExisting || false, function (v) {
+        state.overwriteExisting = v;
+      });
+      card.appendChild(overwriteSwitch);
+
+      // 进度显示
+      var progressEl = el("div", { style: { marginTop: "10px", fontSize: "12px", color: "var(--blue)" } });
+      card.appendChild(progressEl);
+
+      // 开始按钮
+      var startBtn = el("button", { class: "dms-btn dms-btn-primary", style: { width: "100%", marginTop: "10px" } }, ["\u5f00\u59cb\u8f6e\u8be2\u751f\u6210"]);
+      startBtn.addEventListener("click", function () {
+        var dates = [];
+        if (useRangeMode) {
+          var s = rangeStartInput.value, e = rangeEndInput.value;
+          if (!s || !e) { toast("\u8bf7\u9009\u62e9\u8d77\u6b62\u65e5\u671f"); return; }
+          if (s > e) { toast("\u8d77\u59cb\u65e5\u671f\u4e0d\u80fd\u665a\u4e8e\u7ed3\u675f\u65e5\u671f"); return; }
+          // 补齐范围内所有天数
+          var cur = parseDateInput(s);
+          var endD = parseDateInput(e);
+          while (cur <= endD) {
+            dates.push(toDateKey(cur));
+            cur.setDate(cur.getDate() + 1);
+          }
+        } else {
+          dates = Object.keys(selectedDates).sort();
+        }
+        if (!dates.length) { toast("\u8bf7\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u65e5\u671f"); return; }
+
+        startBtn.disabled = true;
+        startBtn.textContent = "\u751f\u6210\u4e2d...";
+        progressEl.textContent = "\u5f00\u59cb\u751f\u6210 0/" + dates.length;
+
+        batchGenerateDailyDiaries(roche, state, dates, function (idx, total, success, msg) {
+          progressEl.textContent = "\u8fdb\u5ea6 " + (idx + 1) + "/" + total + " - " + msg;
+        }).then(function (results) {
+          var successCount = results.filter(function (r) { return r.success; }).length;
+          var failCount = results.filter(function (r) { return !r.success; }).length;
+          progressEl.textContent = "\u5b8c\u6210\uff01\u6210\u529f " + successCount + " \u5931\u8d25 " + failCount;
+          startBtn.disabled = false;
+          startBtn.textContent = "\u91cd\u65b0\u5f00\u59cb";
+          toast("\u8f6e\u8be2\u751f\u6210\u5b8c\u6210");
+        }).catch(function (e) {
+          progressEl.textContent = "\u9519\u8bef\uff1a" + (e && e.message || e);
+          startBtn.disabled = false;
+          startBtn.textContent = "\u91cd\u65b0\u5f00\u59cb";
+        });
+      });
+      card.appendChild(startBtn);
+
+      card.appendChild(el("button", {
+        class: "dms-btn dms-btn-ghost",
+        style: { width: "100%", marginTop: "6px" },
+        onclick: function () { state.view = "cover"; renderContent(); }
+      }, ["\u8fd4\u56de"]));
+      wrap.appendChild(card);
+      return wrap;
+    }
+
+    /* ---------- 从长期记忆挑选视图 ---------- */
+    function buildPickFromMemoryView() {
+      var wrap = el("div", { class: "dms-wrap dms-fade-in" });
+      var card = el("div", { class: "dms-card" }, [
+        el("h2", {}, [el("span", { class: "dms-badge" }, ["\u2605"]), " \u4ece\u957f\u671f\u8bb0\u5fc6\u6311\u9009"]),
+        el("div", { class: "dms-card-sub" }, ["\u4ece\u4e8b\u5b9e\u8bb0\u5fc6\u4e2d\u7b5b\u9009\u5df2\u6709\u7684\u6309\u65e5\u65e5\u8bb0\uff0c\u53ef\u4f5c\u4e3a\u5468\u671f\u6574\u7406\u7684\u7d20\u6750\u3002"])
+      ]);
+
+      var cid = state.selectedConv ? (state.selectedConv.conversationId || state.selectedConv.id) : "";
+
+      // 最低字数输入
+      var minCharsInput = el("input", { type: "number", class: "dms-input", value: "50", min: "0", step: "10", style: { width: "120px" } });
+      card.appendChild(el("div", { style: { marginBottom: "10px" } }, [
+        el("div", { style: { fontSize: "12px", color: "var(--ink-dim)", marginBottom: "4px" } }, ["\u6700\u4f4e\u5b57\u6570\u9650\u5236\uff08\u5c0f\u4e8e\u6b64\u5b57\u6570\u7684\u5c06\u88ab\u8fc7\u6ee4\uff09"]),
+        minCharsInput
+      ]));
+
+      var resultArea = el("div", { style: { marginTop: "10px", maxHeight: "400px", overflowY: "auto" } });
+      card.appendChild(resultArea);
+
+      var loadBtn = el("button", { class: "dms-btn dms-btn-primary", style: { width: "100%" } }, ["\u52a0\u8f7d\u8bb0\u5fc6"]);
+      loadBtn.addEventListener("click", function () {
+        var minChars = parseInt(minCharsInput.value, 10) || 0;
+        loadBtn.disabled = true;
+        loadBtn.textContent = "\u52a0\u8f7d\u4e2d...";
+        resultArea.innerHTML = "";
+        pickDailyDiariesFromFactMemory(roche, cid, minChars).then(function (picked) {
+          loadBtn.disabled = false;
+          loadBtn.textContent = "\u91cd\u65b0\u52a0\u8f7d";
+          if (!picked.length) {
+            resultArea.appendChild(el("div", { class: "dms-empty" }, ["\u672a\u627e\u5230\u7b26\u5408\u6761\u4ef6\u7684\u8bb0\u5fc6\u3002"]));
+            return;
+          }
+          picked.forEach(function (item) {
+            var d = el("div", { class: "dms-hist" }, [
+              el("div", { class: "dms-hist-head" }, [
+                el("div", { class: "dms-hist-title" }, [item.dateKey]),
+                el("div", { class: "dms-hist-date" }, [item.text.length + " \u5b57"])
+              ]),
+              el("div", { class: "dms-hist-snippet" }, [item.text.slice(0, 80) + "\u2026"])
+            ]);
+            resultArea.appendChild(d);
+          });
+          // 显示统计
+          card.insertBefore(el("div", { style: { fontSize: "12px", color: "var(--blue)", marginBottom: "8px" } }, ["\u627e\u5230 " + picked.length + " \u7bc7\u7b26\u5408\u6761\u4ef6\u7684\u65e5\u8bb0"]), resultArea);
+        }).catch(function (e) {
+          loadBtn.disabled = false;
+          loadBtn.textContent = "\u91cd\u65b0\u52a0\u8f7d";
+          resultArea.appendChild(el("div", { class: "dms-empty" }, ["\u52a0\u8f7d\u5931\u8d25\uff1a" + (e && e.message || e)]));
+        });
+      });
+      card.appendChild(loadBtn);
+
+      card.appendChild(el("button", {
+        class: "dms-btn dms-btn-ghost",
+        style: { width: "100%", marginTop: "6px" },
+        onclick: function () { state.view = "cover"; renderContent(); }
+      }, ["\u8fd4\u56de"]));
+      wrap.appendChild(card);
+      return wrap;
+    }
+
     /* ---------- 历史记录 ---------- */
     function buildHistory() {
       var wrap = el("div", { class: "dms-wrap dms-fade-in" });
@@ -3595,7 +4347,7 @@
             item.appendChild(btns);
             card.appendChild(item);
           });
-          card.appendChild(el("div", { style: { marginTop: "10px" } }, [
+          card.appendChild(el("div", { style: { marginTop: "10px", display: "flex", gap: "6px", flexWrap: "wrap" } }, [
             el("button", { class: "dms-btn dms-btn-sm", onclick: function () {
               roche.ui.confirm({ title: "\u6e05\u7a7a", message: "\u6e05\u7a7a\u5168\u90e8\u65e5\u8bb0\uff08\u4ea4\u6362\u65e5\u8bb0 + char\u65e5\u8bb0\uff09\uff1f" }).then(function (ok) {
                 if (!ok) return;
@@ -3604,7 +4356,13 @@
                   roche.storage.set(STORAGE_DIARIES_SOLO, {})
                 ]).then(function () { toast("\u5df2\u6e05\u7a7a"); renderContent(); });
               });
-            } }, ["\u6e05\u7a7a\u5168\u90e8"])
+            } }, ["\u6e05\u7a7a\u65e5\u8bb0"]),
+            el("button", { class: "dms-btn dms-btn-sm", onclick: function () {
+              roche.ui.confirm({ title: "\u6e05\u7a7a", message: "\u6e05\u7a7a\u5168\u90e8\u5468\u671f\u603b\u7ed3\uff1f" }).then(function (ok) {
+                if (!ok) return;
+                return roche.storage.set(STORAGE_DIARIES_PERIOD, {}).then(function () { toast("\u5df2\u6e05\u7a7a"); renderContent(); });
+              });
+            } }, ["\u6e05\u7a7a\u5468\u671f\u603b\u7ed3"])
           ]));
         }
       });
