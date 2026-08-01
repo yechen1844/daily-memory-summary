@@ -2248,9 +2248,10 @@
     // 批注气泡（.dms-annot-tooltip）内的文本保持纯文本，不提取表情包
     function hydrateStickerMarks(container, cid, pageEl) {
       if (!container) return;
-      // 需要页面 body 才能承载贴纸；没有则保留标记原文不处理
-      if (!pageEl || !pageEl.querySelector(".dms-page-body")) return;
       getStickerLib(roche).then(function (lib) {
+        // 需要页面 body 才能承载贴纸；此时 DOM 已构建完成，若仍无 body 则保留标记原文不处理
+        var body = pageEl ? pageEl.querySelector(".dms-page-body") : null;
+        if (!body) return;
         state.stickerLib = lib;
         var stickers = cid ? getStickersForConv(lib, cid) : [];
         if (!stickers.length) return;
