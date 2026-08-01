@@ -2085,7 +2085,7 @@
         userTextEl.style.display = "none";
       }
       userBody.appendChild(userTextEl);
-      hydrateStickerMarks(userTextEl, diary.conversationId);
+      hydrateStickerMarks(userTextEl, diary.conversationId, userPage);
       // 允许 user 在自己的日记上选文字（供 char 批注使用，或 user 自己标记）
       setupTextSelection(userTextEl, userPage);
 
@@ -2243,10 +2243,13 @@
     }
 
     /* ---------- 批注渲染（按段落） ---------- */
-    // 把日记正文中的表情包标记渲染为表情包图片（异步加载表情包库后替换文本节点）
+    // 把日记正文中的表情包标记提取为页面贴纸（像 user 贴的表情包一样独立渲染）
     // 兼容两种写法：①【表情包：说明】②直接【说明】（说明与挂载库 caption 匹配即渲染）
-    function hydrateStickerMarks(container, cid) {
+    // 批注气泡（.dms-annot-tooltip）内的文本保持纯文本，不提取表情包
+    function hydrateStickerMarks(container, cid, pageEl) {
       if (!container) return;
+      // 需要页面 body 才能承载贴纸；没有则保留标记原文不处理
+      if (!pageEl || !pageEl.querySelector(".dms-page-body")) return;
       getStickerLib(roche).then(function (lib) {
         state.stickerLib = lib;
         var stickers = cid ? getStickersForConv(lib, cid) : [];
@@ -2254,7 +2257,11 @@
         var walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
         var nodes = [];
         while (walker.nextNode()) nodes.push(walker.currentNode);
+        var added = [];
         nodes.forEach(function (node) {
+          // 批注气泡内的文本不提取，保持纯文本
+          var p = node.parentNode;
+          if (p && p.closest && p.closest(".dms-annot-tooltip")) return;
           var text = node.nodeValue || "";
           if (text.indexOf("\u3010") < 0) return;
           var re = /\u3010([^\u3011]+)\u3011/g;
@@ -2271,28 +2278,28 @@
               if (sc === cap || (sc && (sc.indexOf(cap) >= 0 || cap.indexOf(sc) >= 0))) { hit = stickers[i]; break; }
             }
             if (hit) {
-              // 贴纸式渲染：图片 + 说明文字，轻微旋转 + 阴影，看起来像贴在日记上
-              var wrap = el("span", {
-                class: "dms-sticker-inline",
-                title: cap,
-                style: {
-                  display: "inline-flex", flexDirection: "column", alignItems: "center",
-                  verticalAlign: "middle", margin: "2px 4px", padding: "4px",
-                  background: "var(--paper-2)", border: "1px solid var(--line)",
-                  borderRadius: "10px", boxShadow: "0 2px 6px rgba(74,60,40,.18)",
-                  transform: "rotate(-3deg)", lineHeight: "1.2"
-                }
-              });
-              wrap.appendChild(el("img", {
-                src: hit.url, alt: cap,
-                style: { width: "48px", height: "48px", objectFit: "contain", display: "block" }
-              }));
-              if (cap) {
-                wrap.appendChild(el("div", {
-                  style: { fontSize: "9px", color: "var(--ink-mute)", maxWidth: "72px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: "2px" }
-                }, [cap]));
+              // 去重：同款表情包已贴过则不再重复添加
+              var existing = (state.currentDiary && state.currentDiary.stickers || []).filter(function (s) {
+                return s.byChar && (s.caption || "") === (hit.caption || "");
+              })[0];
+              if (!existing && state.currentDiary) {
+                if (!state.currentDiary.stickers) state.currentDiary.stickers = [];
+                var placed = {
+                  id: "charStk" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+                  url: hit.url,
+                  caption: hit.caption || cap,
+                  x: 30 + Math.random() * 90,
+                  y: 50 + Math.random() * 90,
+                  size: 64,
+                  blockId: null,
+                  byChar: true,
+                  createdAt: Date.now()
+                };
+                state.currentDiary.stickers.push(placed);
+                added.push(placed);
               }
-              frag.appendChild(wrap);
+              // 标记位置留空格，避免文字粘连
+              frag.appendChild(document.createTextNode(" "));
             } else {
               // 未匹配到：保留原文
               frag.appendChild(document.createTextNode(m[0]));
@@ -2302,6 +2309,14 @@
           if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
           if (node.parentNode) node.parentNode.replaceChild(frag, node);
         });
+        // 把提取出的表情包渲染为页面贴纸（像 user 贴的一样），并保存
+        if (added.length) {
+          var body = pageEl ? pageEl.querySelector(".dms-page-body") : null;
+          if (body) {
+            added.forEach(function (s) { body.appendChild(makeSticker(s, pageEl)); });
+          }
+          saveCurrentDiary();
+        }
       });
     }
 
@@ -5348,7 +5363,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.7",
+    version: "2.7.8",
     apps: [
       {
         id: "daily-memory-summary-home",
