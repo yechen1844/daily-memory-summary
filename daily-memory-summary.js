@@ -1,5 +1,5 @@
 /*
- * 手账日记 (daily-memory-summary) v2.7.3
+ * 手账日记 (daily-memory-summary) v2.7.4
  * 手账本风格的交换日记 — user先写日记，再让TA回写，互相贴表情包/便签。
  * 风格：暖色纸张手账本 + 手写字体 + 和纸胶带装饰。
  * v2.2.0:
@@ -40,6 +40,7 @@
   var DEFAULT_SETTINGS = {
     showFacts: false,
     showCore: false,
+    factInjectCount: 5,        // 事实记忆注入篇数（0 = 全部注入）
     useWorldbook: false,
     worldbookCategories: [],
     worldbookEntries: [],
@@ -231,6 +232,19 @@
   }
   function coreToText(core) { return core ? (core.summary || core.summaryText || core.text || "") : ""; }
 
+  /* 取最近 N 篇事实记忆（按 when/createdAt 排序，新到旧；n<=0 表示全部） */
+  function takeLatestFacts(facts, n) {
+    var arr = (facts || []).slice();
+    if (!n || n <= 0 || arr.length <= n) return arr;
+    arr.sort(function (a, b) {
+      var wa = a.when || a.date || a.dateKey || a.createdAt || "";
+      var wb = b.when || b.date || b.dateKey || b.createdAt || "";
+      if (wa === wb) return 0;
+      return wa > wb ? -1 : 1;
+    });
+    return arr.slice(0, n);
+  }
+
   /* ---------- 上下文拼装 ---------- */
   function buildCtx(roche, state, day) {
     var conv = state.selectedConv;
@@ -264,7 +278,10 @@
           var memP;
           if (state.settings.showCore || state.settings.showFacts) {
             memP = loadLong(roche, cid).then(function (lt) {
-              return { core: state.settings.showCore ? coreToText(lt.core) : "", facts: state.settings.showFacts ? factsToText(lt.facts) : "" };
+              return {
+                core: state.settings.showCore ? coreToText(lt.core) : "",
+                facts: state.settings.showFacts ? factsToText(takeLatestFacts(lt.facts, state.settings.factInjectCount)) : ""
+              };
             });
           } else { memP = Promise.resolve({ core: "", facts: "" }); }
 
@@ -311,7 +328,8 @@
 
     var fmt = fillTemplate(settings.charFormat, ctx);
     var userMsg = (fmt.trim() ? fmt : "\u8bf7\u76f4\u63a5\u4ee5 {{char}} \u7684\u7b2c\u4e00\u4eba\u5199\u65e5\u8bb0\u3002") +
-      "\n\n\u7ea6\u675f\uff1a\u4e0d\u634f\u9020\u7528\u6237\u672a\u8f93\u5165\u7684\u8a00\u884c\uff0c\u4e0d\u62a2\u8bdd\u7528\u6237\uff0c\u8f93\u51fa\u8bed\u8a00\u4e0e\u804a\u5929\u8bb0\u5f55\u4e00\u81f4\u3002";
+      "\n\n\u7ea6\u675f\uff1a\u4e0d\u634f\u9020\u7528\u6237\u672a\u8f93\u5165\u7684\u8a00\u884c\uff0c\u4e0d\u62a2\u8bdd\u7528\u6237\uff0c\u8f93\u51fa\u8bed\u8a00\u4e0e\u804a\u5929\u8bb0\u5f55\u4e00\u81f4\u3002" +
+      "\n\u4f60\u53ef\u4ee5\u5728\u65e5\u8bb0\u6b63\u6587\u4e2d\u8d34\u8868\u60c5\u5305\uff0c\u7528\u683c\u5f0f\u3010\u8868\u60c5\u5305\uff1a\u8868\u60c5\u5305\u7684\u8bf4\u660e\u3011\uff08\u5982\u3010\u8868\u60c5\u5305\uff1a\u5f00\u5fc3\u3011\u3010\u8868\u60c5\u5305\uff1a\u59d4\u5c48\u3011\uff09\uff0c\u63d2\u5165\u5728\u60f3\u8868\u8fbe\u60c5\u7eea\u7684\u4f4d\u7f6e\uff0c\u8bf4\u660e\u8981\u77ed\u5c0f\u8d34\u5408\u60c5\u5883\u3002";
     return [{ role: "system", content: sys.join("\n\n") }, { role: "user", content: userMsg }];
   }
 
@@ -1999,6 +2017,7 @@
       var charTextEl = el("div", { class: "dms-diary-text", id: "charDiaryText" });
       renderAnnotatedText(charTextEl, diary.charDiary || "", diary.annotations || []);
       charBody.appendChild(charTextEl);
+      hydrateStickerMarks(charTextEl);
 
       (diary.annotations || []).filter(function (a) { return a.type === "sticky"; }).forEach(function (a) {
         charBody.appendChild(makeStickyNote(a, charPage));
@@ -2042,6 +2061,7 @@
         userTextEl.style.display = "none";
       }
       userBody.appendChild(userTextEl);
+      hydrateStickerMarks(userTextEl, diary.conversationId);
       // 允许 user 在自己的日记上选文字（供 char 批注使用，或 user 自己标记）
       setupTextSelection(userTextEl, userPage);
 
@@ -2199,6 +2219,47 @@
     }
 
     /* ---------- 批注渲染（按段落） ---------- */
+    // 把日记正文中的【表情包：说明】渲染为表情包图片（异步加载表情包库后替换文本节点）
+    function hydrateStickerMarks(container, cid) {
+      if (!container) return;
+      getStickerLib(roche).then(function (lib) {
+        state.stickerLib = lib;
+        var stickers = cid ? getStickersForConv(lib, cid) : [];
+        if (!stickers.length) return;
+        var walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        var nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        nodes.forEach(function (node) {
+          var text = node.nodeValue || "";
+          if (text.indexOf("\u3010\u8868\u60c5\u5305\uff1a") < 0) return;
+          var re = /\u3010\u8868\u60c5\u5305\uff1a([^\u3011]+)\u3011/g;
+          var frag = document.createDocumentFragment();
+          var last = 0, m;
+          while ((m = re.exec(text)) !== null) {
+            if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+            var cap = (m[1] || "").trim();
+            var hit = null;
+            for (var i = 0; i < stickers.length; i++) {
+              var sc = (stickers[i].caption || "").trim();
+              if (sc === cap || (sc && (sc.indexOf(cap) >= 0 || cap.indexOf(sc) >= 0))) { hit = stickers[i]; break; }
+            }
+            if (hit) {
+              frag.appendChild(el("img", {
+                class: "dms-sticker-inline", src: hit.url, alt: cap, title: cap,
+                style: { width: "44px", height: "44px", objectFit: "contain", verticalAlign: "middle", borderRadius: "6px", margin: "0 2px", background: "var(--paper-2)", border: "1px solid var(--line)", padding: "2px" }
+              }));
+            } else {
+              // 未匹配到：保留原文
+              frag.appendChild(document.createTextNode(m[0]));
+            }
+            last = m.index + m[0].length;
+          }
+          if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+          if (node.parentNode) node.parentNode.replaceChild(frag, node);
+        });
+      });
+    }
+
     function renderAnnotatedText(container, text, annotations) {
       container.innerHTML = "";
       if (!text) {
@@ -3466,6 +3527,23 @@
       sec1.appendChild(makeSwitch("\u6ce8\u5165\u4e8b\u5b9e\u8bb0\u5fc6", "\u4f5c\u4e3a\u53c2\u8003\u6ce8\u5165\u7ed9AI", state.settings.showFacts, function (v) {
         state.settings.showFacts = v; saveSettings(roche, state.settings);
       }));
+      if (state.settings.showFacts) {
+        var factRow = el("div", { style: { display: "flex", alignItems: "center", gap: "8px", paddingLeft: "16px", marginTop: "6px" } }, [
+          el("div", { style: { flex: "1", fontSize: "12px", color: "var(--ink)" } }, ["\u6ce8\u5165\u8fd1\u671f\u51e0\u7bc7\u4e8b\u5b9e\u8bb0\u5fc6\uff1a"]),
+          el("input", {
+            type: "number", min: "0", max: "50", class: "dms-input",
+            style: { width: "64px", textAlign: "center" },
+            value: state.settings.factInjectCount || 0
+          })
+        ]);
+        var fcInput = factRow.querySelector("input");
+        fcInput.addEventListener("change", function () {
+          state.settings.factInjectCount = Math.max(0, Math.min(50, Math.floor(Number(this.value) || 0)));
+          saveSettings(roche, state.settings); toast("\u5df2\u4fdd\u5b58\uff080=\u5168\u90e8\u6ce8\u5165\uff09");
+        });
+        factRow.appendChild(el("div", { class: "dms-hint", style: { fontSize: "11px", color: "var(--ink-mute)", whiteSpace: "nowrap" } }, ["0=\u5168\u90e8"]));
+        sec1.appendChild(factRow);
+      }
       sec1.appendChild(makeSwitch("\u542f\u7528\u4e16\u754c\u4e66", "\u52fe\u9009\u540e\u53ef\u6311\u9009\u5206\u7c7b/\u8bcd\u6761", state.settings.useWorldbook, function (v) {
         state.settings.useWorldbook = v; saveSettings(roche, state.settings);
         if (v && !state.worldbookTree.length) { loadWbTree(roche).then(function (t) { state.worldbookTree = t; toggleSettings(true); renderContent(); }); }
@@ -4168,7 +4246,9 @@
           el("button", { class: "dms-tool-btn", onclick: function () { state.view = "periodDialog"; renderContent(); } }, ["\u8fd4\u56de"])
         ])
       ]));
-      card.appendChild(el("div", { class: "dms-diary-text", style: { marginTop: "10px" } }, [d.charDiary || ""]));
+      var diaryTextEl = el("div", { class: "dms-diary-text", style: { marginTop: "10px" } }, [d.charDiary || ""]);
+      card.appendChild(diaryTextEl);
+      hydrateStickerMarks(diaryTextEl, d.conversationId);
 
       // 显示数据源
       if (d.source === "daily" && d.sourceDiaries && d.sourceDiaries.length) {
@@ -4759,6 +4839,7 @@
         "1. \u5199\u4f60\u7684\u65e5\u8bb0\uff08\u4ee5\u4f60\u81ea\u5df1\u7684\u53e3\u543b\u56de\u5e94 TA \u7684\u65e5\u8bb0\uff09\n" +
         "2. \u4f5c\u4e3a " + (ctx.charName || "\u89d2\u8272") + "\uff0c\u5728 " + (ctx.userName || "\u7528\u6237") + " \u7684\u65e5\u8bb0\u4e0a\u505a\u6587\u5b57\u6279\u6ce8\uff08\u5212\u6389/\u8868\u767d/\u6279\u6ce8\uff09\n" +
         "3. \u7ed9 " + (ctx.userName || "\u7528\u6237") + " \u7684\u65e5\u8bb0\u8d34 4~6 \u5f20\u4fbf\u7b7e\n\n" +
+        "\u4f60\u8fd8\u53ef\u4ee5\u5728\u65e5\u8bb0\u6b63\u6587\u4e2d\u8d34\u8868\u60c5\u5305\uff0c\u7528\u683c\u5f0f\u3010\u8868\u60c5\u5305\uff1a\u8868\u60c5\u5305\u7684\u8bf4\u660e\u3011\uff08\u5982\u3010\u8868\u60c5\u5305\uff1a\u5f00\u5fc3\u3011\u3010\u8868\u60c5\u5305\uff1a\u59d4\u5c48\u3011\uff09\uff0c\u63d2\u5165\u5728\u60f3\u8868\u8fbe\u60c5\u7eea\u7684\u4f4d\u7f6e\uff0c\u8bf4\u660e\u8981\u77ed\u5c0f\u8d34\u5408\u60c5\u5883\u3002\n\n" +
         "\u4e25\u683c\u6309\u4ee5\u4e0b\u683c\u5f0f\u8f93\u51fa\uff08\u4e0d\u8981\u8f93\u51fa\u5176\u4ed6\u5185\u5bb9\uff09\uff1a\n" +
         "\u3010\u65e5\u8bb0\u5f00\u59cb\u3011\n\u4f60\u7684\u65e5\u8bb0\u6b63\u6587\u2026\n\u3010\u65e5\u8bb0\u7ed3\u675f\u3011\n\n" +
         "\u3010\u6279\u6ce8\u5f00\u59cb\u3011\n" +
@@ -5168,7 +5249,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.3",
+    version: "2.7.4",
     apps: [
       {
         id: "daily-memory-summary-home",
