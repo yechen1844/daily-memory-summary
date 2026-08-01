@@ -2041,7 +2041,7 @@
       var charTextEl = el("div", { class: "dms-diary-text", id: "charDiaryText" });
       renderAnnotatedText(charTextEl, diary.charDiary || "", diary.annotations || []);
       charBody.appendChild(charTextEl);
-      hydrateStickerMarks(charTextEl, diary.conversationId);
+      hydrateStickerMarks(charTextEl, diary.conversationId, charPage);
 
       (diary.annotations || []).filter(function (a) { return a.type === "sticky"; }).forEach(function (a) {
         charBody.appendChild(makeStickyNote(a, charPage));
