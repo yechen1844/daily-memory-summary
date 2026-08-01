@@ -2243,7 +2243,8 @@
     }
 
     /* ---------- 批注渲染（按段落） ---------- */
-    // 把日记正文中的【表情包：说明】渲染为表情包图片（异步加载表情包库后替换文本节点）
+    // 把日记正文中的表情包标记渲染为表情包图片（异步加载表情包库后替换文本节点）
+    // 兼容两种写法：①【表情包：说明】②直接【说明】（说明与挂载库 caption 匹配即渲染）
     function hydrateStickerMarks(container, cid) {
       if (!container) return;
       getStickerLib(roche).then(function (lib) {
@@ -2255,13 +2256,15 @@
         while (walker.nextNode()) nodes.push(walker.currentNode);
         nodes.forEach(function (node) {
           var text = node.nodeValue || "";
-          if (text.indexOf("\u3010\u8868\u60c5\u5305\uff1a") < 0) return;
-          var re = /\u3010\u8868\u60c5\u5305\uff1a([^\u3011]+)\u3011/g;
+          if (text.indexOf("\u3010") < 0) return;
+          var re = /\u3010([^\u3011]+)\u3011/g;
           var frag = document.createDocumentFragment();
           var last = 0, m;
           while ((m = re.exec(text)) !== null) {
             if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-            var cap = (m[1] || "").trim();
+            // 去掉「表情包：」前缀（兼容两种写法）
+            var raw = (m[1] || "").trim();
+            var cap = raw.replace(/^\u8868\u60c5\u5305[\uff1a:]\s*/, "").trim();
             var hit = null;
             for (var i = 0; i < stickers.length; i++) {
               var sc = (stickers[i].caption || "").trim();
@@ -5327,7 +5330,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.5",
+    version: "2.7.6",
     apps: [
       {
         id: "daily-memory-summary-home",
