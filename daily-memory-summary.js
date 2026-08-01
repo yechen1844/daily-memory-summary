@@ -1,5 +1,5 @@
 /*
- * 手账日记 (daily-memory-summary) v2.7.9
+ * 手账日记 (daily-memory-summary) v2.7.10
  * 手账本风格的交换日记 — user先写日记，再让TA回写，互相贴表情包/便签。
  * 风格：暖色纸张手账本 + 手写字体 + 和纸胶带装饰。
  * v2.2.0:
@@ -2085,7 +2085,7 @@
         userTextEl.style.display = "none";
       }
       userBody.appendChild(userTextEl);
-      hydrateStickerMarks(userTextEl, diary.conversationId, userPage);
+      hydrateStickerMarks(userTextEl, diary.conversationId, userPage, "charStickers");
       // 允许 user 在自己的日记上选文字（供 char 批注使用，或 user 自己标记）
       setupTextSelection(userTextEl, userPage);
 
@@ -2243,10 +2243,26 @@
     }
 
     /* ---------- 批注渲染（按段落） ---------- */
+    // 计算某段落末尾附近的贴纸位置（相对 page-body），DOM 需已挂载
+    // count: 同一段落第几张贴纸（从 0 起），多张时依次向左排开、向下微降，避免挤到一起
+    function snapPosToBlock(pageEl, blockId, w, h, jitter, count) {
+      var body = pageEl ? pageEl.querySelector(".dms-page-body") : null;
+      if (!body || !blockId) return null;
+      var block = body.querySelector('.dms-block[data-block-id="' + blockId + '"]');
+      if (!block) return null;
+      var br = body.getBoundingClientRect();
+      var r = block.getBoundingClientRect();
+      var j = jitter || 12;
+      var n = count || 0;
+      return {
+        x: Math.max(0, (r.left - br.left) + r.width - w - 6 - n * (w + 10) + Math.random() * j),
+        y: Math.max(0, (r.bottom - br.top) + Math.random() * j - 20 + n * 12)
+      };
+    }
     // 把日记正文中的表情包标记提取为页面贴纸（像 user 贴的表情包一样独立渲染）
     // 兼容两种写法：①【表情包：说明】②直接【说明】（说明与挂载库 caption 匹配即渲染）
-    // 批注气泡（.dms-annot-tooltip）内的文本保持纯文本，不提取表情包
-    function hydrateStickerMarks(container, cid, pageEl) {
+    // storeKey: "stickers"=char 页（左页） | "charStickers"=user 页（右页），避免串页
+    function hydrateStickerMarks(container, cid, pageEl, storeKey) {
       if (!container) return;
       getStickerLib(roche).then(function (lib) {
         // 需要页面 body 才能承载贴纸；此时 DOM 已构建完成，若仍无 body 则保留标记原文不处理
@@ -2259,10 +2275,9 @@
         var nodes = [];
         while (walker.nextNode()) nodes.push(walker.currentNode);
         var added = [];
+        // 同一段落多张表情包时依次排开，避免挤到一起
+        var blockCounts = {};
         nodes.forEach(function (node) {
-          // 批注气泡内的文本不提取，保持纯文本
-          var p = node.parentNode;
-          if (p && p.closest && p.closest(".dms-annot-tooltip")) return;
           var text = node.nodeValue || "";
           if (text.indexOf("\u3010") < 0) return;
           var re = /\u3010([^\u3011]+)\u3011/g;
@@ -2280,26 +2295,39 @@
             }
             if (hit) {
               // 去重：同款表情包已贴过则不再重复添加
-              var existing = (state.currentDiary && state.currentDiary.stickers || []).filter(function (s) {
+              var store = (state.currentDiary && state.currentDiary[storeKey]) || [];
+              var existing = store.filter(function (s) {
                 return s.byChar && (s.caption || "") === (hit.caption || "");
               })[0];
               if (!existing && state.currentDiary) {
-                if (!state.currentDiary.stickers) state.currentDiary.stickers = [];
+                if (!state.currentDiary[storeKey]) state.currentDiary[storeKey] = [];
+                // 定位到该标记所在段落的末尾附近（找不到段落则按序号分散摆放）
+                var blkEl = node.parentNode && node.parentNode.closest ? node.parentNode.closest(".dms-block") : null;
+                var blkId = blkEl ? (blkEl.getAttribute("data-block-id") || null) : null;
+                if (blkId && !blockCounts[blkId]) blockCounts[blkId] = 0;
+                var pos = snapPosToBlock(pageEl, blkId, 64, 64, 14, blkId ? blockCounts[blkId] : 0);
+                if (blkId) blockCounts[blkId]++;
+                if (!pos) {
+                  var rowIdx = added.length % 3;
+                  var colIdx = Math.floor(added.length / 3);
+                  pos = { x: 20 + colIdx * 130 + Math.random() * 40, y: 50 + rowIdx * 120 + Math.random() * 40 };
+                }
                 var placed = {
                   id: "charStk" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
                   url: hit.url,
                   caption: hit.caption || cap,
-                  x: 30 + Math.random() * 90,
-                  y: 50 + Math.random() * 90,
+                  x: pos.x,
+                  y: pos.y,
                   size: 64,
-                  blockId: null,
+                  blockId: blkId,
+                  _snapped: true,   // 提取时已定位，渲染不再二次吸附
                   byChar: true,
                   createdAt: Date.now()
                 };
-                state.currentDiary.stickers.push(placed);
+                state.currentDiary[storeKey].push(placed);
                 added.push(placed);
               }
-              // 标记位置留空格，避免文字粘连
+              // 标记位置留空格，避免文字粘连（批注气泡内的标记同样被提取，气泡只留文本）
               frag.appendChild(document.createTextNode(" "));
             } else {
               // 未匹配到：保留原文
@@ -2312,10 +2340,7 @@
         });
         // 把提取出的表情包渲染为页面贴纸（像 user 贴的一样），并保存
         if (added.length) {
-          var body = pageEl ? pageEl.querySelector(".dms-page-body") : null;
-          if (body) {
-            added.forEach(function (s) { body.appendChild(makeSticker(s, pageEl)); });
-          }
+          added.forEach(function (s) { body.appendChild(makeSticker(s, pageEl)); });
           saveCurrentDiary();
         }
       });
@@ -2645,6 +2670,18 @@
       }
 
       var sticky = el("div", { class: stickyClass, style: stickyStyle });
+      // 若带段落关联且未被 user 手动拖过，吸附到该段落末尾附近（延迟到 DOM 挂载后再算位置）
+      if (annot.blockId && !annot._moved) {
+        setTimeout(function () {
+          if (!sticky.isConnected) return;
+          var sp = snapPosToBlock(pageEl, annot.blockId, sticky.offsetWidth || 120, sticky.offsetHeight || 80, 16);
+          if (sp) {
+            annot.x = sp.x; annot.y = sp.y;
+            sticky.style.left = sp.x + "px";
+            sticky.style.top = sp.y + "px";
+          }
+        }, 0);
+      }
       var text = el("div", { contentEditable: annot.byChar ? "false" : "true", style: { outline: "none", minHeight: "20px" } }, [annot.comment || (annot.byChar ? "" : "\u53cc\u51fb\u7f16\u8f91\u2026")]);
       if (!annot.byChar) {
         text.addEventListener("blur", function () {
@@ -2784,6 +2821,7 @@
       }
       function onDragUp() {
         if (dragInfo && dragInfo.moved) {
+          annot._moved = true;  // 用户手动拖过，之后不再吸附回段落末尾
           updateBlockIdByPosition();
           saveCurrentDiary();
           sticky.classList.remove("dragging");
@@ -3036,6 +3074,18 @@
       });
       var img = el("img", { src: s.url, alt: s.caption || "", style: { width: "100%", height: "100%" } });
       sticker.appendChild(img);
+      // 若带段落关联、未被 user 手动拖过、且非提取时已定位，吸附到该段落末尾附近（延迟到 DOM 挂载后再算位置）
+      if (s.blockId && !s._moved && !s._snapped) {
+        setTimeout(function () {
+          if (!sticker.isConnected) return;
+          var sp = snapPosToBlock(pageEl, s.blockId, sticker.offsetWidth || size, sticker.offsetHeight || size, 14);
+          if (sp) {
+            s.x = sp.x; s.y = sp.y;
+            sticker.style.left = sp.x + "px";
+            sticker.style.top = sp.y + "px";
+          }
+        }, 0);
+      }
       if (s.caption) {
         sticker.appendChild(el("div", { class: "dms-sticker-cap" }, [s.caption]));
       }
@@ -3050,9 +3100,14 @@
       var delBtn = el("button", { class: "dms-sticker-del", onclick: function (ev) {
         ev.stopPropagation();
         if (!state.currentDiary) return;
+        // 兼容 stickers 与 charStickers 两种存储
         var arr = state.currentDiary.stickers || [];
         var i = arr.indexOf(s);
         if (i >= 0) { arr.splice(i, 1); state.currentDiary.stickers = arr; }
+        else if (state.currentDiary.charStickers) {
+          var j = state.currentDiary.charStickers.indexOf(s);
+          if (j >= 0) state.currentDiary.charStickers.splice(j, 1);
+        }
         saveCurrentDiary();
         sticker.remove();
       } }, ["\u00d7"]);
@@ -3174,6 +3229,7 @@
       }
       function onDragUp() {
         if (dragInfo && dragInfo.moved) {
+          s._moved = true;  // 用户手动拖过，之后不再吸附回段落末尾
           updateStickerBlockIdByPosition();
           saveCurrentDiary();
           sticker.classList.remove("dragging");
@@ -4985,6 +5041,9 @@
               if (sc === cap || (sc && (sc.indexOf(cap) >= 0 || cap.indexOf(sc) >= 0))) { hit = mounted[i]; break; }
             }
             if (hit) {
+              // 与便签一致：循环分配到各段落，渲染时吸附到对应段落末尾附近
+              var stkBlockId = null;
+              if (userBlocks.length) stkBlockId = userBlocks[idx % userBlocks.length].id;
               charStickers.push({
                 id: "charStk" + Date.now() + "_" + idx,
                 url: hit.url,
@@ -4992,7 +5051,7 @@
                 x: 20 + (idx * 70) + Math.random() * 40,
                 y: 80 + (idx * 90) + Math.random() * 40,
                 size: 64,
-                blockId: null,
+                blockId: stkBlockId,
                 byChar: true,
                 createdAt: Date.now()
               });
@@ -5364,7 +5423,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.9",
+    version: "2.7.10",
     apps: [
       {
         id: "daily-memory-summary-home",
