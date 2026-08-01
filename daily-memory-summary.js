@@ -5364,7 +5364,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.8",
+    version: "2.7.9",
     apps: [
       {
         id: "daily-memory-summary-home",
