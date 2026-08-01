@@ -1,5 +1,5 @@
 /*
- * 手账日记 (daily-memory-summary) v2.7.6
+ * 手账日记 (daily-memory-summary) v2.7.7
  * 手账本风格的交换日记 — user先写日记，再让TA回写，互相贴表情包/便签。
  * 风格：暖色纸张手账本 + 手写字体 + 和纸胶带装饰。
  * v2.2.0:
@@ -2041,7 +2041,7 @@
       var charTextEl = el("div", { class: "dms-diary-text", id: "charDiaryText" });
       renderAnnotatedText(charTextEl, diary.charDiary || "", diary.annotations || []);
       charBody.appendChild(charTextEl);
-      hydrateStickerMarks(charTextEl);
+      hydrateStickerMarks(charTextEl, diary.conversationId);
 
       (diary.annotations || []).filter(function (a) { return a.type === "sticky"; }).forEach(function (a) {
         charBody.appendChild(makeStickyNote(a, charPage));
@@ -2271,10 +2271,28 @@
               if (sc === cap || (sc && (sc.indexOf(cap) >= 0 || cap.indexOf(sc) >= 0))) { hit = stickers[i]; break; }
             }
             if (hit) {
-              frag.appendChild(el("img", {
-                class: "dms-sticker-inline", src: hit.url, alt: cap, title: cap,
-                style: { width: "44px", height: "44px", objectFit: "contain", verticalAlign: "middle", borderRadius: "6px", margin: "0 2px", background: "var(--paper-2)", border: "1px solid var(--line)", padding: "2px" }
+              // 贴纸式渲染：图片 + 说明文字，轻微旋转 + 阴影，看起来像贴在日记上
+              var wrap = el("span", {
+                class: "dms-sticker-inline",
+                title: cap,
+                style: {
+                  display: "inline-flex", flexDirection: "column", alignItems: "center",
+                  verticalAlign: "middle", margin: "2px 4px", padding: "4px",
+                  background: "var(--paper-2)", border: "1px solid var(--line)",
+                  borderRadius: "10px", boxShadow: "0 2px 6px rgba(74,60,40,.18)",
+                  transform: "rotate(-3deg)", lineHeight: "1.2"
+                }
+              });
+              wrap.appendChild(el("img", {
+                src: hit.url, alt: cap,
+                style: { width: "48px", height: "48px", objectFit: "contain", display: "block" }
               }));
+              if (cap) {
+                wrap.appendChild(el("div", {
+                  style: { fontSize: "9px", color: "var(--ink-mute)", maxWidth: "72px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: "2px" }
+                }, [cap]));
+              }
+              frag.appendChild(wrap);
             } else {
               // 未匹配到：保留原文
               frag.appendChild(document.createTextNode(m[0]));
@@ -5330,7 +5348,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.6",
+    version: "2.7.7",
     apps: [
       {
         id: "daily-memory-summary-home",
