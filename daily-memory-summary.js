@@ -1,5 +1,5 @@
 /*
- * 手账日记 (daily-memory-summary) v2.7.10
+ * 手账日记 (daily-memory-summary) v2.7.11
  * 手账本风格的交换日记 — user先写日记，再让TA回写，互相贴表情包/便签。
  * 风格：暖色纸张手账本 + 手写字体 + 和纸胶带装饰。
  * v2.2.0:
@@ -3089,14 +3089,6 @@
       if (s.caption) {
         sticker.appendChild(el("div", { class: "dms-sticker-cap" }, [s.caption]));
       }
-      // 块标记小角标
-      if (s.blockId) {
-        sticker.appendChild(el("div", {
-          class: "dms-sticker-blocktag",
-          title: "\u6240\u5c5e\u5757: " + s.blockId,
-          style: { position: "absolute", top: "-2px", left: "-2px", fontSize: "8px", color: "#FAF3E3", background: "var(--blue)", borderRadius: "3px", padding: "0 3px" }
-        }, [s.blockId]));
-      }
       var delBtn = el("button", { class: "dms-sticker-del", onclick: function (ev) {
         ev.stopPropagation();
         if (!state.currentDiary) return;
@@ -5423,7 +5415,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.10",
+    version: "2.7.11",
     apps: [
       {
         id: "daily-memory-summary-home",
