@@ -284,18 +284,33 @@
               };
             });
           } else { memP = Promise.resolve({ core: "", facts: "" }); }
+          // 当前会话挂载的表情包说明列表（供 AI 选择贴哪个表情包，避免瞎猜导致前端匹配不到）
+          var stickerP = getStickerLib(roche).then(function (lib) {
+            var stickers = getStickersForConv(lib, cid);
+            var caps = [];
+            (stickers || []).forEach(function (s) {
+              var c = (s.caption || "").trim();
+              if (c && caps.indexOf(c) < 0) caps.push(c);
+            });
+            return caps;
+          });
 
           return memP.then(function (mem) {
             var wbP = state.settings.useWorldbook ? loadWbText(roche, state.settings) : Promise.resolve("");
             return wbP.then(function (wb) {
-              return {
+              var ctx = {
                 conversationId: cid, isGroup: info.isGroup,
                 userName: uName, userPersona: uPersona,
                 charName: ch.name, charText: ch.text,
                 dayShort: dayMsgs, shortText: shortT,
                 coreText: mem.core, factsText: mem.facts,
-                wbText: wb, dateKey: toDateKey(day)
+                wbText: wb, dateKey: toDateKey(day),
+                stickerCaptions: []
               };
+              return Promise.resolve(stickerP).then(function (caps) {
+                ctx.stickerCaptions = caps || [];
+                return ctx;
+              });
             });
           });
         });
@@ -327,9 +342,18 @@
     if (chain.trim()) sys.push("\u3010\u601d\u7ef4\u94fe\u3011\n" + chain);
 
     var fmt = fillTemplate(settings.charFormat, ctx);
+    // 可用表情包说明列表（挂载到当前会话的），AI 只能从中选择，避免生成前端匹配不到的说明
+    var capText = "";
+    if (ctx.stickerCaptions && ctx.stickerCaptions.length) {
+      capText = "\n\u4f60\u53ef\u4ee5\u5728\u65e5\u8bb0\u6b63\u6587\u4e2d\u8d34\u8868\u60c5\u5305\uff0c\u7528\u683c\u5f0f\u3010\u8868\u60c5\u5305\uff1a\u8868\u60c5\u5305\u7684\u8bf4\u660e\u3011\uff0c\u63d2\u5165\u5728\u60f3\u8868\u8fbe\u60c5\u7eea\u7684\u4f4d\u7f6e\u3002\u53ef\u7528\u7684\u8868\u60c5\u5305\u8bf4\u660e\u5982\u4e0b\uff0c\u5fc5\u987b\u4ece\u4e2d\u9009\u62e9\u4e00\u4e2a\uff0c\u4e0d\u8981\u81ea\u521b\uff1a\n" +
+        ctx.stickerCaptions.map(function (c) { return "\u3010" + c + "\u3011"; }).join(" ") +
+        "\n\uff08\u53ef\u9009\u5730\u8d34 0~3 \u4e2a\uff0c\u4e0d\u8981\u592a\u591a\uff09";
+    } else {
+      capText = "\n\uff08\u5f53\u524d\u4f1a\u8bdd\u672a\u6302\u8f7d\u8868\u60c5\u5305\uff0c\u65e0\u9700\u8d34\u8868\u60c5\u5305\uff09";
+    }
     var userMsg = (fmt.trim() ? fmt : "\u8bf7\u76f4\u63a5\u4ee5 {{char}} \u7684\u7b2c\u4e00\u4eba\u5199\u65e5\u8bb0\u3002") +
       "\n\n\u7ea6\u675f\uff1a\u4e0d\u634f\u9020\u7528\u6237\u672a\u8f93\u5165\u7684\u8a00\u884c\uff0c\u4e0d\u62a2\u8bdd\u7528\u6237\uff0c\u8f93\u51fa\u8bed\u8a00\u4e0e\u804a\u5929\u8bb0\u5f55\u4e00\u81f4\u3002" +
-      "\n\u4f60\u53ef\u4ee5\u5728\u65e5\u8bb0\u6b63\u6587\u4e2d\u8d34\u8868\u60c5\u5305\uff0c\u7528\u683c\u5f0f\u3010\u8868\u60c5\u5305\uff1a\u8868\u60c5\u5305\u7684\u8bf4\u660e\u3011\uff08\u5982\u3010\u8868\u60c5\u5305\uff1a\u5f00\u5fc3\u3011\u3010\u8868\u60c5\u5305\uff1a\u59d4\u5c48\u3011\uff09\uff0c\u63d2\u5165\u5728\u60f3\u8868\u8fbe\u60c5\u7eea\u7684\u4f4d\u7f6e\uff0c\u8bf4\u660e\u8981\u77ed\u5c0f\u8d34\u5408\u60c5\u5883\u3002";
+      capText;
     return [{ role: "system", content: sys.join("\n\n") }, { role: "user", content: userMsg }];
   }
 
@@ -4785,11 +4809,13 @@
           : generateCharDiary(roche, ctx, state.settings);
 
         return genP.then(function (result) {
-          // 兼容：交换模式返回 { diary, charAnnotations }，非交换模式返回 text
+          // 兼容：交换模式返回 { diary, charAnnotations, charStickers }，非交换模式返回 text
           var diaryText = (typeof result === "string") ? result : (result.diary || "");
           var newCharAnnots = (typeof result === "object" && result.charAnnotations) ? result.charAnnotations : [];
+          var newCharStickers = (typeof result === "object" && result.charStickers) ? result.charStickers : [];
           // 合并：交换模式下用新生成的 charAnnotations 覆盖旧的（批注+便签一起重新生成）
           var charAnnots = userDiaryText.trim() ? newCharAnnots : ((existing && existing.charAnnotations) || []);
+          var charStickers = userDiaryText.trim() ? newCharStickers : ((existing && existing.charStickers) || []);
           var diaryData = {
             conversationId: ctx.conversationId,
             charName: ctx.charName,
@@ -4803,6 +4829,7 @@
             annotations: (existing && existing.annotations) || [],
             stickers: (existing && existing.stickers) || [],
             charAnnotations: charAnnots,
+            charStickers: charStickers,
             ctx: ctx,
             createdAt: (existing && existing.createdAt) || (state.currentDiary && state.currentDiary.createdAt) || Date.now(),
             updatedAt: Date.now()
@@ -4834,12 +4861,20 @@
       var msgs = buildCharDiaryMessages(ctx, settings);
       // 在最后追加 user 的日记作为参考
       msgs.push({ role: "assistant", content: "\u3010" + (ctx.userName || "\u7528\u6237") + "\u521a\u5199\u7684\u65e5\u8bb0\u3011\n" + userDiaryText + "\n\n\u8bf7\u5728\u4f60\u7684\u65e5\u8bb0\u4e2d\u56de\u5e94\u5bf9\u8bdd TA \u7684\u65e5\u8bb0\u3002" });
+      var capText = "";
+      if (ctx.stickerCaptions && ctx.stickerCaptions.length) {
+        capText = "\u4f60\u8fd8\u53ef\u4ee5\u5728\u65e5\u8bb0\u6b63\u6587\u4e2d\u8d34\u8868\u60c5\u5305\uff0c\u7528\u683c\u5f0f\u3010\u8868\u60c5\u5305\uff1a\u8868\u60c5\u5305\u7684\u8bf4\u660e\u3011\uff0c\u63d2\u5165\u5728\u60f3\u8868\u8fbe\u60c5\u7eea\u7684\u4f4d\u7f6e\u3002\u53ef\u7528\u7684\u8868\u60c5\u5305\u8bf4\u660e\u5fc5\u987b\u4ece\u4e0b\u5217\u9009\u62e9\uff0c\u4e0d\u8981\u81ea\u521b\uff1a\n" +
+          ctx.stickerCaptions.map(function (c) { return "\u3010" + c + "\u3011"; }).join(" ") +
+          "\n\uff08\u53ef\u9009\u5730\u8d34 0~3 \u4e2a\uff09\n\n";
+      } else {
+        capText = "\uff08\u5f53\u524d\u4f1a\u8bdd\u672a\u6302\u8f7d\u8868\u60c5\u5305\uff0c\u65e0\u9700\u8d34\u8868\u60c5\u5305\uff09\n\n";
+      }
       msgs.push({ role: "user", content:
         "\u73b0\u5728\u8bf7\u4f60\u540c\u65f6\u5b8c\u6210\u4e09\u4ef6\u4e8b\uff1a\n\n" +
         "1. \u5199\u4f60\u7684\u65e5\u8bb0\uff08\u4ee5\u4f60\u81ea\u5df1\u7684\u53e3\u543b\u56de\u5e94 TA \u7684\u65e5\u8bb0\uff09\n" +
         "2. \u4f5c\u4e3a " + (ctx.charName || "\u89d2\u8272") + "\uff0c\u5728 " + (ctx.userName || "\u7528\u6237") + " \u7684\u65e5\u8bb0\u4e0a\u505a\u6587\u5b57\u6279\u6ce8\uff08\u5212\u6389/\u8868\u767d/\u6279\u6ce8\uff09\n" +
         "3. \u7ed9 " + (ctx.userName || "\u7528\u6237") + " \u7684\u65e5\u8bb0\u8d34 4~6 \u5f20\u4fbf\u7b7e\n\n" +
-        "\u4f60\u8fd8\u53ef\u4ee5\u5728\u65e5\u8bb0\u6b63\u6587\u4e2d\u8d34\u8868\u60c5\u5305\uff0c\u7528\u683c\u5f0f\u3010\u8868\u60c5\u5305\uff1a\u8868\u60c5\u5305\u7684\u8bf4\u660e\u3011\uff08\u5982\u3010\u8868\u60c5\u5305\uff1a\u5f00\u5fc3\u3011\u3010\u8868\u60c5\u5305\uff1a\u59d4\u5c48\u3011\uff09\uff0c\u63d2\u5165\u5728\u60f3\u8868\u8fbe\u60c5\u7eea\u7684\u4f4d\u7f6e\uff0c\u8bf4\u660e\u8981\u77ed\u5c0f\u8d34\u5408\u60c5\u5883\u3002\n\n" +
+        capText +
         "\u4e25\u683c\u6309\u4ee5\u4e0b\u683c\u5f0f\u8f93\u51fa\uff08\u4e0d\u8981\u8f93\u51fa\u5176\u4ed6\u5185\u5bb9\uff09\uff1a\n" +
         "\u3010\u65e5\u8bb0\u5f00\u59cb\u3011\n\u4f60\u7684\u65e5\u8bb0\u6b63\u6587\u2026\n\u3010\u65e5\u8bb0\u7ed3\u675f\u3011\n\n" +
         "\u3010\u6279\u6ce8\u5f00\u59cb\u3011\n" +
@@ -4902,16 +4937,48 @@
             createdAt: Date.now()
           });
         });
-        return { diary: parsed.diary, charAnnotations: charAnnots };
+        return getStickerLib(roche).then(function (lib) {
+          // 便签区块里隔离出的表情包说明 → char 给 user 贴的表情包（从挂载库匹配图片）
+          var charStickers = [];
+          var mounted = (ctx && ctx.conversationId) ? getStickersForConv(lib, ctx.conversationId) : [];
+          parsed.stickerNotes.forEach(function (cap, idx) {
+            var hit = null;
+            for (var i = 0; i < mounted.length; i++) {
+              var sc = (mounted[i].caption || "").trim();
+              if (sc === cap || (sc && (sc.indexOf(cap) >= 0 || cap.indexOf(sc) >= 0))) { hit = mounted[i]; break; }
+            }
+            if (hit) {
+              charStickers.push({
+                id: "charStk" + Date.now() + "_" + idx,
+                url: hit.url,
+                caption: hit.caption || cap,
+                x: 20 + (idx * 70) + Math.random() * 40,
+                y: 80 + (idx * 90) + Math.random() * 40,
+                size: 64,
+                blockId: null,
+                byChar: true,
+                createdAt: Date.now()
+              });
+            }
+          });
+          return { diary: parsed.diary, charAnnotations: charAnnots, charStickers: charStickers };
+        });
       });
     }
 
-    /* ---------- 解析 char 输出：分离日记、批注、便签 ---------- */
+    /* ---------- 解析 char 输出：分离日记、批注、便签、表情包 ----------
+     * 格式约定（避免与便签混淆）：
+     *   - 表情包：只写在日记正文里，内嵌标记【表情包：说明】（说明必须取自挂载库列表）
+     *   - 便签：独立区块【便签开始】...【便签结束】，每行一条
+     * 兜底：便签区块里若混入【表情包：说明】行，自动识别为表情包而非便签
+     */
     function parseCharDiaryAndStickyNotes(text) {
-      if (!text) return { diary: "", annotations: [], stickyNotes: [] };
+      if (!text) return { diary: "", annotations: [], stickyNotes: [], stickerNotes: [] };
       var diary = "";
       var annotations = [];
       var stickyNotes = [];
+      var stickerNotes = [];
+      var STICKER_MARK_RE = /\u3010\u8868\u60c5\u5305\uff1a([^\u3011]+)\u3011/g;
 
       // 提取日记
       var diaryRe = /\u3010\u65e5\u8bb0\u5f00\u59cb\u3011([\s\S]*?)\u3010\u65e5\u8bb0\u7ed3\u675f\u3011/g;
@@ -4937,25 +5004,34 @@
           ["comment", "heart", "crossout"].indexOf(a.type) >= 0;
       });
 
-      // 提取便签
+      // 提取便签；【表情包：xx】行不当作便签，归入 stickerNotes
       var stickyRe = /\u3010\u4fbf\u7b7e\u5f00\u59cb\u3011([\s\S]*?)\u3010\u4fbf\u7b7e\u7ed3\u675f\u3011/g;
       var sm;
       while ((sm = stickyRe.exec(text)) !== null) {
         var content = sm[1].trim();
         content.split("\n").forEach(function (line) {
           line = line.trim();
-          if (line) stickyNotes.push(line);
+          if (!line) return;
+          var smk = line.match(/^\u3010\u8868\u60c5\u5305\uff1a([^\u3011]+)\u3011$/);
+          if (smk) {
+            var c = smk[1].trim();
+            if (c) stickerNotes.push(c);
+            return;
+          }
+          stickyNotes.push(line);
         });
       }
 
-      // 如果没有任何标记，尝试旧格式（【便签】行）
+      // 旧格式（【便签】行）同样隔离表情包
       if (!diary && !annotations.length && !stickyNotes.length) {
         var lines = text.split("\n");
         var diaryLines = [];
         lines.forEach(function (line) {
           var sm2 = line.match(/^\u3010\u4fbf\u7b7e\u3011\s*(.*)$/);
           if (sm2) {
-            if (sm2[1].trim()) stickyNotes.push(sm2[1].trim());
+            var smk2 = sm2[1].match(/^\u3010\u8868\u60c5\u5305\uff1a([^\u3011]+)\u3011$/);
+            if (smk2 && smk2[1].trim()) stickerNotes.push(smk2[1].trim());
+            else if (sm2[1].trim()) stickyNotes.push(sm2[1].trim());
           } else {
             diaryLines.push(line);
           }
@@ -4966,7 +5042,8 @@
 
       if (stickyNotes.length > 6) stickyNotes = stickyNotes.slice(0, 6);
       if (annotations.length > 6) annotations = annotations.slice(0, 6);
-      return { diary: diary, annotations: annotations, stickyNotes: stickyNotes };
+      if (stickerNotes.length > 3) stickerNotes = stickerNotes.slice(0, 3);
+      return { diary: diary, annotations: annotations, stickyNotes: stickyNotes, stickerNotes: stickerNotes };
     }
 
     /* ---------- 通过 RocheToolkit 或 IndexedDB 把交换日记作为系统消息注入主聊天 ---------- */
@@ -5181,6 +5258,7 @@
         generateCharDiaryWithUserRef(roche, ctx, state.settings, userText).then(function (result) {
           state.currentDiary.charDiary = result.diary || "";
           state.currentDiary.charAnnotations = result.charAnnotations || [];
+          if (result.charStickers) state.currentDiary.charStickers = result.charStickers;
           state.currentDiary.updatedAt = Date.now();
           return saveCurrentDiary().then(function () {
             var annotCount = (result.charAnnotations || []).filter(function (a) { return a.selectedText; }).length;
@@ -5249,7 +5327,7 @@
   window.RochePlugin.register({
     id: "daily-memory-summary",
     name: "\u624b\u8d26\u65e5\u8bb0",
-    version: "2.7.4",
+    version: "2.7.5",
     apps: [
       {
         id: "daily-memory-summary-home",
